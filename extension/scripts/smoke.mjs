@@ -18,6 +18,12 @@
  *
  * Chromium refuses to load extensions without a browser UI, so if there is no
  * DISPLAY this script re-execs itself under xvfb-run.
+ *
+ * With APC_E2E_LISTENER_URL + APC_E2E_TOKEN set (scripts/e2e.py), the extension
+ * is pointed at a REAL `apc serve` instead of the mock listener above. The site
+ * fixtures are unchanged; only the listener half of the local server goes
+ * unused, so the assertions that inspect the mock's captured requests are
+ * skipped and delivery is proven through the worker's own `status.last24h`.
  */
 
 import http from 'node:http';
@@ -42,6 +48,12 @@ const CLAUDE_URL = `https://claude.ai/code/session/${CLAUDE_SESSION_ID}`;
 const SECRET_EMAIL = 'leaked.person@example.com';
 const LINE_ONE = 'summarise the changelog';
 const LINE_TWO = `and cc ${SECRET_EMAIL}`;
+
+/* ------------------------------------------- real-listener (e2e) overrides */
+
+const E2E_LISTENER_URL = (process.env.APC_E2E_LISTENER_URL || '').replace(/\/+$/, '');
+const E2E_TOKEN = process.env.APC_E2E_TOKEN || '';
+const E2E = E2E_LISTENER_URL !== '' && E2E_TOKEN !== '';
 
 /* --------------------------------------------------- headed re-exec helper */
 
@@ -195,6 +207,16 @@ function check(name, condition, detail) {
   }
 }
 
+// Assertions that read `received` (what the MOCK listener saw). Meaningless when
+// the extension is posting to a real `apc serve`, so they are skipped there.
+function mockCheck(name, condition, detail) {
+  if (E2E) {
+    console.log(`skip ${name} -- real listener; not observable from here`);
+    return;
+  }
+  check(name, condition, detail);
+}
+
 async function waitFor(label, predicate, timeoutMs = 15000, intervalMs = 200) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -217,6 +239,10 @@ async function main() {
   const port = server.address().port;
   const serverUrl = `http://127.0.0.1:${port}`;
   console.log(`[smoke] local site + listener on ${serverUrl}`);
+
+  const listenerUrl = E2E ? E2E_LISTENER_URL : serverUrl;
+  const listenerToken = E2E ? E2E_TOKEN : TOKEN;
+  if (E2E) console.log(`[smoke] APC_E2E: extension will target the real listener ${listenerUrl}`);
 
   userDataDir = mkdtempSync(join(tmpdir(), 'apc-smoke-'));
   context = await chromium.launchPersistentContext(userDataDir, {
@@ -251,9 +277,20 @@ async function main() {
       });
       await chrome.storage.local.set({ token, apc_queue: [], apc_captures: [], apc_last_error: null });
     },
-    { serverUrl, token: TOKEN, account: ACCOUNT },
+    { serverUrl: listenerUrl, token: listenerToken, account: ACCOUNT },
   );
   check('options page loaded and seeded', true);
+
+  // How many captures the worker has actually delivered. Against the mock we can
+  // count the POSTs it received; against a real listener the worker's own
+  // last-24h counter (incremented only on a successful POST) is the evidence.
+  const delivered = async () => {
+    if (!E2E) return received.prompts.length;
+    const s = await optionsPage.evaluate(
+      () => new Promise((r) => chrome.runtime.sendMessage({ type: 'status' }, r)),
+    );
+    return s && typeof s.last24h === 'number' ? s.last24h : 0;
+  };
 
   // 3. serve the fixture at https://chatgpt.com/** so content_scripts matches fire
   await context.route(/^https:\/\/(chatgpt\.com|claude\.ai)\//, async (route) => {
@@ -293,14 +330,14 @@ async function main() {
   await page.keyboard.type(LINE_TWO);
   await page.keyboard.press('Enter');
 
-  const got = await waitFor('POST /v1/prompts', async () => received.prompts.length > 0, 20000);
-  check('listener received a POST /v1/prompts', got, `prompts: ${received.prompts.length}`);
+  const got = await waitFor('POST /v1/prompts', async () => (await delivered()) > 0, 20000);
+  check('listener received a POST /v1/prompts', got, `delivered: ${await delivered()}`);
 
   // the page's own handler must still have run (we never preventDefault)
   const pageSubmitted = await page.evaluate(() => window.__lastSubmitted || null);
   check('page submit handler still ran (no preventDefault from us)', !!pageSubmitted, String(pageSubmitted));
 
-  if (got) {
+  if (got && !E2E) {
     const body = received.prompts[0];
     check('source is chatgpt_web', body.source === 'chatgpt_web', JSON.stringify(body.source));
     check('account is the allowlisted address', body.account === ACCOUNT, JSON.stringify(body.account));
@@ -344,8 +381,12 @@ async function main() {
   const test = await optionsPage.evaluate(
     () => new Promise((resolveP) => chrome.runtime.sendMessage({ type: 'testConnection' }, resolveP)),
   );
-  check('testConnection hit /v1/health and /v1/config', test && test.ok === true && received.config > 0, JSON.stringify(test));
-  check('no request was rejected for a bad token', received.unauthorised === 0, `401s: ${received.unauthorised}`);
+  check(
+    'testConnection hit /v1/health and /v1/config',
+    test && test.ok === true && (E2E || received.config > 0),
+    JSON.stringify(test),
+  );
+  mockCheck('no request was rejected for a bad token', received.unauthorised === 0, `401s: ${received.unauthorised}`);
 
   // 6. failure path: point the worker at a dead port and confirm the capture
   //    lands in the retry queue instead of being lost.
@@ -373,7 +414,7 @@ async function main() {
   );
   check('last error is recorded for the popup', !!(failedStatus && failedStatus.lastError && failedStatus.lastError.message), JSON.stringify(failedStatus && failedStatus.lastError));
   check('listener is reported unreachable', failedStatus && failedStatus.reachable === false, JSON.stringify(failedStatus && failedStatus.reachable));
-  check('the queued prompt never reached the real listener', received.prompts.length === 1, `prompts: ${received.prompts.length}`);
+  mockCheck('the queued prompt never reached the real listener', received.prompts.length === 1, `prompts: ${received.prompts.length}`);
 
   const cleared = await optionsPage.evaluate(
     () => new Promise((r) => chrome.runtime.sendMessage({ type: 'clearQueue' }, r)),
@@ -386,7 +427,7 @@ async function main() {
 
   // 7. claude.ai: source mapping, the DOM account fallback, and the single
   //    most important safety rule - an unknown account captures nothing.
-  await optionsPage.evaluate((url) => chrome.storage.sync.set({ serverUrl: url }), serverUrl);
+  await optionsPage.evaluate((url) => chrome.storage.sync.set({ serverUrl: url }), listenerUrl);
   currentFixture = FIXTURE_CLAUDE;
   const claudePage = await context.newPage();
   await claudePage.goto(CLAUDE_URL, { waitUntil: 'domcontentloaded' });
@@ -395,13 +436,13 @@ async function main() {
   check('claude account endpoints were tried and 404d', received.organizations > 0 && received.account > 0,
     `orgs: ${received.organizations}, account: ${received.account}`);
 
-  const before = received.prompts.length;
+  const before = await delivered();
   await claudePage.click('fieldset div[contenteditable="true"]');
   await claudePage.keyboard.type('this must NOT be captured, the account is unknown');
   await claudePage.keyboard.press('Enter');
   await claudePage.waitForTimeout(2500);
-  check('nothing is captured while the account is unknown', received.prompts.length === before,
-    `prompts: ${received.prompts.length}`);
+  check('nothing is captured while the account is unknown', (await delivered()) === before,
+    `delivered: ${await delivered()}`);
 
   // Open the profile popover so the DOM fallback has something to read, then
   // bust the 10-minute account cache the way the popup's refresh does.
@@ -420,9 +461,9 @@ async function main() {
   await claudePage.click('fieldset div[contenteditable="true"]');
   await claudePage.keyboard.type('explain the tokenizer');
   await claudePage.click('button[aria-label="Send Message"]');
-  const claudeGot = await waitFor('claude capture', async () => received.prompts.length > before, 15000);
-  check('send-button click captures on claude.ai', claudeGot, `prompts: ${received.prompts.length}`);
-  if (claudeGot) {
+  const claudeGot = await waitFor('claude capture', async () => (await delivered()) > before, 15000);
+  check('send-button click captures on claude.ai', claudeGot, `delivered: ${await delivered()}`);
+  if (claudeGot && !E2E) {
     const body = received.prompts[received.prompts.length - 1];
     check('claude source is claude_code_web', body.source === 'claude_code_web', JSON.stringify(body.source));
     check('claude prompt text is right', body.prompt === 'explain the tokenizer', JSON.stringify(body.prompt));
