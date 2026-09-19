@@ -53,10 +53,10 @@ Categories, in the order they are applied:
 | Category | Matches |
 |---|---|
 | `private_key` | `-----BEGIN ... PRIVATE KEY-----` blocks, including the body |
-| `ssh_key` | SSH material. Declared in `CATEGORIES`; the matching rule was still being written when this was documented, so check `pii.py` before relying on it |
+| `ssh_key` | `ssh-rsa`, `ssh-ed25519`, `ecdsa-sha2-*` public key lines, including the trailing comment |
 | `jwt` | `eyJ...` three-part tokens |
-| `webhook_url` | webhook endpoints. Same caveat as `ssh_key`: declared, rule pending |
-| `api_key` | `sk-`, `sk-ant-`, `sk-proj-`, `github_pat_`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`, `glpat-`, `xox[abpsr]-`, `AKIA`/`ASIA`, `AIza`, `npm_`, `pypi-`, `hf_`, `Bearer <token>`, and the value of a generic `api_key`/`token`/`secret`/`password` assignment |
+| `webhook_url` | Slack, Discord, Microsoft Teams and Google Chat incoming webhook URLs |
+| `api_key` | `sk-`, `sk-ant-`, `sk-proj-`, `github_pat_`, `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`, `glpat-`, `xox[abpsr]-`, `AKIA`/`ASIA`, `AIza`, `npm_`, `pypi-`, `hf_`, Stripe `sk_live_`/`pk_live_`/`sk_test_`, Twilio `AC`/`SK` ids, SendGrid `SG.`, Google OAuth `ya29.`, `Bearer <token>`, and the value of a `password`/`secret`/`token`/`client_secret`/`passphrase` style assignment or header, including prefixed names like `DB_PASSWORD` |
 | `url_credentials` | the `user:pass` between `://` and `@` in a URL |
 | `credit_card` | 13 to 19 digits with optional spaces or dashes, Luhn-valid |
 | `iban` | two letters, two check digits, then 11 to 30 alphanumerics, mod-97 valid |
@@ -64,9 +64,9 @@ Categories, in the order they are applied:
 | `email` | addresses with a real TLD, so `foo@bar` in code is left alone |
 | `phone` | E.164 and common grouped formats, 7 to 15 digits, rejecting dates and version strings |
 | `ipv6` | full and compressed forms |
-| `ipv4` | dotted quads, **including private and loopback ranges**: a private address still identifies a network |
+| `ipv4` | dotted quads, including private RFC1918 ranges (they still identify a network). Loopback `127.0.0.0/8` and `0.0.0.0` are left alone so `curl http://127.0.0.1:8000/` survives |
 | `mac_address` | colon or dash separated |
-| `uk_postcode` | UK postcodes. Same caveat as `ssh_key`: declared, rule pending |
+| `uk_postcode` | UK postcodes in canonical form (uppercase, one space, e.g. `NW1 6XE`); lowercase or unspaced forms are not matched to limit false positives on short identifiers |
 | `home_path` | the username in `/Users/x`, `/home/x`, `C:\Users\x`, and bare `/root` |
 | `user_term` | your `extra_terms`, word-bounded and case-insensitive |
 | `custom` | your `extra_patterns` |

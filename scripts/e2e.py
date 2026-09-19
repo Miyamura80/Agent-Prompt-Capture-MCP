@@ -45,26 +45,7 @@ REPO = Path(__file__).resolve().parents[1]
 # --------------------------------------------------------------------------
 
 KNOWN_BUGS: dict[str, str] = {
-    "opencode-attachments": (
-        "src/agent_prompt_capture/adapters/opencode.py:32-38 builds metadata from "
-        "_META_KEYS = ('model', 'provider', 'agent', 'mode') only, so the "
-        "`attachments` count the plugin sends "
-        "(opencode-plugin/agent-prompt-capture.js:104) is dropped. "
-        "docs/research/hook-specs.md:819-820 requires it: "
-        "'count them into metadata.attachments'."
-    ),
-    "pii-uuid-credit-card": (
-        "src/agent_prompt_capture/pii.py (the `credit_card` rule) matches the last two "
-        "groups of a UUID. Repro: "
-        '`python -c "from agent_prompt_capture.pii import scrub; '
-        "print(scrub('11111111-2222-3333-4444-555555555555'))\"` -> "
-        "'11111111-2222-3333-[CREDIT_CARD_1]' {'credit_card': 1}. "
-        "'4444-555555555555' is 16 digits and genuinely Luhn-valid, but it is part of a "
-        "longer hyphenated token, so the card rule should refuse it the way the phone "
-        "rule already refuses digits inside a longer run. Effect: every browser "
-        "conversation_id (a UUID) is stored mangled as session_id, so `apc list "
-        "--session-id <real uuid>` and any join back to the chat UI silently miss."
-    ),
+    # id -> description. Empty: every src/ bug found so far has been fixed.
 }
 
 # --------------------------------------------------------------------------
@@ -704,7 +685,6 @@ def step_opencode(env: Env) -> None:
         "metadata.attachments == 1 (one file part)",
         str(rec["metadata"].get("attachments")) == "1",
         f"metadata={json.dumps(rec['metadata'])}",
-        known_bug="opencode-attachments",
     )
 
     ended = wait_for(
@@ -981,7 +961,6 @@ def step_extension(env: Env, token: str) -> bool:
             "conversation_id became the session id",
             rec["session_id"] == "11111111-2222-3333-4444-555555555555",
             str(rec["session_id"]),
-            known_bug="pii-uuid-credit-card",
         )
 
     web = records(env, source="claude_code_web")

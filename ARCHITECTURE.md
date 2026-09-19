@@ -246,7 +246,7 @@ Rules:
   (`scheme://user:pass@host` -> `scheme://[URL_CREDENTIALS_1]@host`), `credit_card` (13-19 digits
   with optional separators, Luhn-valid), `iban`, `ssn` (US), `email`, `phone` (E.164 and common
   US/UK/EU formats, min 7 digits, must not be inside a longer digit run), `ipv6`, `ipv4`
-  (skip 127.0.0.1, 0.0.0.0, and RFC1918? NO: redact private IPs too, they identify a network),
+  (loopback 127.0.0.0/8 and 0.0.0.0 are left alone; RFC1918 private ranges ARE redacted, they identify a network),
   `mac_address`, `home_path` (via scrub_path rules), `user_term` (extra_terms, word-bounded,
   case-insensitive), `custom` (extra_patterns), `person` / `location` (only when enable_ner).
 * Must not mangle code: do not treat `foo@bar` without a TLD as an email; do not treat
@@ -381,7 +381,7 @@ Install snippet for Claude Code: `claude mcp add agent-prompt-capture -- apc mcp
 ## CLI (`cli.py`)
 
 ```
-apc capture <claude-code|codex|opencode>   read hook JSON on stdin, ingest, exit 0 always
+apc capture <claude-code|codex|opencode> [PAYLOAD]   read hook JSON on stdin (or the trailing argv arg, Codex legacy notify), ingest, exit 0 always
 apc serve [--host H] [--port P] [--allow-remote]
 apc mcp
 apc install <claude-code|codex|opencode> [--dry-run]     writes/merges hook config idempotently
@@ -440,7 +440,7 @@ attention moved between projects*.
 | source        | event                              | how                                         |
 |---------------|------------------------------------|---------------------------------------------|
 | `claude_code` | `Stop` hook (agent finished turn)  | `apc capture claude-code` (same command; adapter branches on `hook_event_name`) |
-| `codex_cli`   | `notify` `agent-turn-complete`     | already handled; it is a turn-end event that also carries the prompt text |
+| `codex_cli`   | `Stop` hook (native hooks.json)    | `apc capture codex`; the legacy `notify` `agent-turn-complete` payload (`--legacy`) is also a turn end and carries the prompt text |
 | `opencode`    | `event` hook `session.idle`        | plugin pipes `{"event":"turn_end","session_id":...,"ts":...}` to `apc capture opencode` |
 | browser       | none for now                       | (DOM heuristics too fragile; future work)   |
 
