@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-prompt-capture"
+version = "0.1.0"
+description = "Capture, scrub and index the prompts you send to your coding agents and chat UIs."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Agent Prompt Capture contributors" }]
+keywords = ["mcp", "prompts", "pii", "claude-code", "codex", "opencode"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = ["mcp>=1.2"]
+
+[project.optional-dependencies]
+ner = ["presidio-analyzer", "spacy"]
+
+[project.scripts]
+apc = "agent_prompt_capture.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/gatlingx/Agent-Prompt-Capture-MCP"
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.6"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_prompt_capture"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "opencode-plugin", "ARCHITECTURE.md"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# Never touch Markdown (ARCHITECTURE.md and docs/ are owned elsewhere) or the
+# Chrome extension, which is plain JS with no Python in it.
+extend-exclude = ["*.md", "extension", "docs", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
