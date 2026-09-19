@@ -427,3 +427,74 @@ well under 1 second (import cost matters: lazy-import the mcp SDK and anything h
   disabled sources), adapters (each payload shape), http listener (auth, CORS, payload),
   mcp server (tool listing + one call per tool via in-memory client), installer (idempotent merge).
 * No network access at test time. No writes outside a tmp `APC_HOME` in tests.
+
+## Time tracking layer (primary use case)
+
+The purpose of the data is to let an agent answer **"what has this person been spending
+their time on, and how could they use it better"**. Prompt text alone is not enough; we
+also need *when* work happened, *how long* the agent worked per prompt, and *how the user's
+attention moved between projects*.
+
+### Extra captured signal: turn-end events
+
+| source        | event                              | how                                         |
+|---------------|------------------------------------|---------------------------------------------|
+| `claude_code` | `Stop` hook (agent finished turn)  | `apc capture claude-code` (same command; adapter branches on `hook_event_name`) |
+| `codex_cli`   | `notify` `agent-turn-complete`     | already handled; it is a turn-end event that also carries the prompt text |
+| `opencode`    | `event` hook `session.idle`        | plugin pipes `{"event":"turn_end","session_id":...,"ts":...}` to `apc capture opencode` |
+| browser       | none for now                       | (DOM heuristics too fragile; future work)   |
+
+Adapters therefore return either a `RawPrompt` or a `RawTurnEnd(session_id, ts, metadata)`.
+`ingest()` handles `RawTurnEnd` by calling `store.mark_turn_end(source, session_id, ts)`,
+which sets `turn_end_ts` on the most recent prompt in that session whose `turn_end_ts` is
+NULL (no-op if none). For `codex_cli` `agent-turn-complete`, ingest first inserts the prompt
+(with `ts` = now minus nothing better; keep `metadata.turn_complete_ts`) and then marks it
+ended in the same call.
+
+### Schema additions
+
+```sql
+ALTER TABLE prompts ADD COLUMN turn_end_ts TEXT;        -- ISO UTC, NULL until the agent finishes
+CREATE INDEX IF NOT EXISTS idx_prompts_session_ts ON prompts(session_id, ts);
+```
+
+`PromptRecord` gains `turn_end_ts: str | None`. Derived (not stored) fields exposed by the
+store/MCP: `agent_seconds = turn_end_ts - ts`, `think_seconds = next prompt ts in same
+session - turn_end_ts` (NULL when unknown).
+
+### config.toml additions
+
+```toml
+[time]
+idle_gap_minutes = 30   # a gap longer than this splits an activity session
+tail_minutes = 5        # credited after the last prompt / turn end of an activity session
+```
+
+### Derived activity sessions (heuristic, computed on read in `timeline.py`)
+
+1. Take all prompts (and their `turn_end_ts`) in range, ordered by `ts`, grouped by
+   `(source, project)` when `group_by` needs it, else globally.
+2. Walk in time order. Start a new activity session when the gap between the previous
+   event's end (`turn_end_ts` if set else `ts`) and the next `ts` exceeds `idle_gap_minutes`.
+3. `active_minutes` of a session = `(last_end - first_ts) + tail_minutes`.
+4. A **context switch** is a consecutive pair of prompts (within one activity session, any
+   grouping) whose `project` differs.
+
+### MCP tools added
+
+| tool                | args                                                                 | returns |
+|---------------------|----------------------------------------------------------------------|---------|
+| `time_summary`      | `since="7d"`, `until?`, `group_by` in `project\|source\|day\|hour_of_day\|weekday\|session` | `{groups:[{key, active_minutes, prompt_count, agent_minutes, avg_think_seconds}], total_active_minutes, context_switches}` |
+| `activity_timeline` | `since="24h"`, `until?`, `bucket` in `hour\|day`                     | `{buckets:[{start, prompt_count, active_minutes, projects:[...], sources:[...]}]}` |
+| `daily_digest`      | `date` (YYYY-MM-DD, default today, local time)                      | `{date, first_activity, last_activity, active_minutes, sessions:[{project, source, start, end, prompt_count, sample_prompts:[3 shortest]}], context_switches, top_terms:[...]}` |
+
+`top_terms` = top 15 lower-cased tokens of length >= 4 after removing a small stopword list
+and any placeholder tokens like `[EMAIL_1]`. Hour-of-day and weekday grouping and `daily_digest`
+use the local timezone of the machine running the MCP server.
+
+Resource added: `apc://digest/today`.
+
+CLI added: `apc time [--since 7d] [--group-by project]` and `apc digest [DATE]`.
+
+The `prompt_stats` tool stays as the cheap count-only query; `time_summary` is the one an
+agent should reach for when asked about time use.
