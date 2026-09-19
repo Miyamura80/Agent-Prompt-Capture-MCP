@@ -1,0 +1,18 @@
+# systemd user unit for the Agent Prompt Capture HTTP listener (Linux).
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp docs/service/apc-listener.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now apc-listener
+# Replace %h/.local/bin/apc with the output of `which apc` if it differs.
+[Unit]
+Description=Agent Prompt Capture local HTTP listener (127.0.0.1 only)
+After=default.target
+
+[Service]
+ExecStart=%h/.local/bin/apc serve
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
