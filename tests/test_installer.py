@@ -111,8 +111,53 @@ def test_claude_install_refuses_broken_json():
     path = claude_settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{not json")
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(ValueError, match="not valid JSON"):
         install("claude-code")
+    assert path.read_text() == "{not json", "a file we cannot parse must be left alone"
+
+
+def test_claude_install_refuses_trailing_commas_with_a_clear_message():
+    """JSON5-isms are the classic way a hand-edited settings.json goes bad."""
+    path = claude_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = '{\n  "hooks": {},\n}\n'
+    path.write_text(original)
+    with pytest.raises(ValueError) as excinfo:
+        install("claude-code")
+    message = str(excinfo.value)
+    assert "not valid JSON" in message
+    assert "trailing commas" in message
+    assert str(path) in message
+    assert path.read_text() == original
+
+
+def test_claude_install_refuses_a_non_object_document():
+    path = claude_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('["not", "an", "object"]')
+    with pytest.raises(ValueError, match="not an object"):
+        install("claude-code")
+    assert json.loads(path.read_text()) == ["not", "an", "object"]
+
+
+def test_claude_install_tolerates_a_utf8_bom():
+    """Notepad and friends write a BOM; that is not a reason to refuse or clobber."""
+    path = claude_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"permissions": {"allow": ["Bash"]}}', encoding="utf-8-sig")
+    install("claude-code")
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    assert data["permissions"] == {"allow": ["Bash"]}
+    assert HOOK_COMMAND in json.dumps(data["hooks"])
+
+
+def test_install_keeps_the_existing_file_mode():
+    path = claude_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}")
+    path.chmod(0o600)
+    install("claude-code")
+    assert path.stat().st_mode & 0o777 == 0o600
 
 
 def test_claude_uninstall():
@@ -390,3 +435,102 @@ def test_installers_write_nothing_outside_home(tmp_path):
         opencode_plugin_path(),
     ):
         assert home in path.parents
+
+
+# ---------------------------------------------------------------------------
+# regressions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("target", ["claude-code", "codex", "opencode"])
+def test_install_three_times_is_byte_identical(target, tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    paths = {
+        "claude-code": claude_settings_path,
+        "codex": codex_hooks_path,
+        "opencode": opencode_plugin_path,
+    }
+    install(target)
+    first = paths[target]().read_bytes()
+    install(target)
+    install(target)
+    assert paths[target]().read_bytes() == first
+    if target != "opencode":
+        document = json.loads(first)
+        blob = json.dumps(document)
+        command = HOOK_COMMAND if target == "claude-code" else CODEX_HOOK_COMMAND
+        assert blob.count(command) == 2  # exactly one per event, never duplicated
+
+
+def test_install_leaves_no_temp_files_behind(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    install("claude-code")
+    leftovers = list((tmp_path / "claude").glob("*.apc-tmp"))
+    assert leftovers == []
+
+
+def test_a_refused_install_leaves_no_temp_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    path = claude_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{broken")
+    with pytest.raises(ValueError):
+        install("claude-code")
+    assert list(path.parent.glob("*.apc-tmp")) == []
+
+
+def test_uninstall_is_idempotent_and_leaves_foreign_hooks(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    path = claude_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command", "command": "other-tool --go"}]}
+                    ],
+                    "PreToolUse": [
+                        {"matcher": "Bash", "hooks": [{"type": "command", "command": "guard"}]}
+                    ],
+                },
+                "permissions": {"allow": ["Bash"]},
+            }
+        )
+    )
+    install("claude-code")
+    uninstall("claude-code")
+    first = path.read_text()
+    uninstall("claude-code")
+    assert path.read_text() == first
+    data = json.loads(first)
+    assert HOOK_COMMAND not in json.dumps(data)
+    assert "other-tool --go" in json.dumps(data["hooks"]["UserPromptSubmit"])
+    assert data["hooks"]["PreToolUse"][0]["matcher"] == "Bash"
+    assert data["permissions"] == {"allow": ["Bash"]}
+
+
+def test_codex_hooks_honour_codex_home_for_uninstall(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "elsewhere"))
+    install("codex")
+    assert (tmp_path / "elsewhere" / "hooks.json").exists()
+    uninstall("codex")
+    assert CODEX_HOOK_COMMAND not in (tmp_path / "elsewhere" / "hooks.json").read_text()
+
+
+def test_opencode_template_matches_the_packaged_plugin():
+    """`apc install opencode` falls back to an embedded copy; it must not drift."""
+    import re
+
+    from agent_prompt_capture.installer import OPENCODE_PLUGIN_SOURCE, _packaged_plugin
+
+    packaged = _packaged_plugin()
+    assert packaged.is_file(), "the packaged plugin should exist in a source checkout"
+
+    def body(text: str) -> str:
+        # Drop the leading comment block; only the code has to agree.
+        return re.sub(r"\s+", " ", text[text.index("const COMMAND") :]).strip()
+
+    assert body(OPENCODE_PLUGIN_SOURCE) == body(packaged.read_text(encoding="utf-8"))

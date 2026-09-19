@@ -227,3 +227,147 @@ def test_allow_remote_override(apc_home, store):
     config = Config(home=apc_home)
     httpd = make_server(config, store, host="127.0.0.1", port=0, allow_remote=True)
     httpd.server_close()
+
+
+# ---------------------------------------------------------------------------
+# regressions: DNS rebinding, token handling
+# ---------------------------------------------------------------------------
+
+
+def raw_request(server, raw: bytes) -> tuple[int, bytes]:
+    """Speak HTTP by hand so we can forge the Host header urllib always sets."""
+    import socket
+
+    host, port = server["httpd"].server_address[:2]
+    with socket.create_connection((host, port), timeout=5) as sock:
+        sock.sendall(raw)
+        chunks = []
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if b"\r\n\r\n" in b"".join(chunks) and len(b"".join(chunks)) > 40:
+                break
+    response = b"".join(chunks)
+    status = int(response.split(b" ", 2)[1])
+    return status, response
+
+
+def forge(server, host_header: str, *, method="GET", path="/v1/health", token=None) -> int:
+    headers = [f"{method} {path} HTTP/1.1", f"Host: {host_header}", "Connection: close"]
+    if token:
+        headers.append(f"X-APC-Token: {token}")
+    body = b""
+    if method == "POST":
+        body = json.dumps(BROWSER).encode()
+        headers.append("Content-Type: application/json")
+        headers.append(f"Content-Length: {len(body)}")
+    raw = ("\r\n".join(headers) + "\r\n\r\n").encode() + body
+    return raw_request(server, raw)[0]
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "evil.example.com",
+        "attacker.test:47821",
+        "apc.localhost.evil.com",
+        "localhost.evil.com",
+        "127.0.0.1.evil.com",
+        "0.0.0.0",
+        "192.168.1.10:47821",
+        "",
+    ],
+)
+def test_a_foreign_host_header_is_rejected(server, host):
+    """DNS rebinding: the socket is reachable from any page whose name resolves here."""
+    assert forge(server, host) == 403
+    assert forge(server, host, method="POST", path="/v1/prompts", token=server["token"]) == 403
+    assert forge(server, host, method="OPTIONS", path="/v1/prompts") == 403
+    assert server["store"].count() == 0
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "127.0.0.1",
+        "127.0.0.1:47821",
+        "localhost",
+        "localhost:47821",
+        "[::1]",
+        "[::1]:47821",
+        "127.0.0.2:9",
+        "LOCALHOST",
+    ],
+)
+def test_our_own_names_are_accepted(server, host):
+    assert forge(server, host) == 200
+
+
+def test_a_missing_host_header_is_rejected(server):
+    status, _ = raw_request(server, b"GET /v1/health HTTP/1.1\r\nConnection: close\r\n\r\n")
+    assert status == 403
+
+
+def test_allow_remote_accepts_the_configured_host(apc_home, store):
+    """`--allow-remote` is an explicit opt-in, so the bound address is a valid name."""
+    from agent_prompt_capture.http_listener import host_allowed
+
+    assert host_allowed("10.1.2.3:47821", extra="10.1.2.3")
+    assert host_allowed("10.1.2.3", extra="10.1.2.3")
+    assert not host_allowed("10.1.2.4", extra="10.1.2.3")
+    assert not host_allowed("evil.example", extra="10.1.2.3")
+    assert not host_allowed(None, extra="10.1.2.3")
+
+
+def test_the_token_comparison_is_constant_time():
+    """`hmac.compare_digest`, on bytes: a non-ASCII header must not raise."""
+    import inspect
+
+    from agent_prompt_capture import http_listener
+
+    source = inspect.getsource(http_listener._Handler._authorised)
+    assert "hmac.compare_digest" in source
+    assert "==" not in source.split("compare_digest")[0].split("def ")[1]
+
+
+def test_a_non_ascii_token_header_is_a_401_not_a_crash(server):
+    """Header values decode as latin-1, and compare_digest rejects non-ASCII str."""
+    status, _ = raw_request(
+        server,
+        "POST /v1/prompts HTTP/1.1\r\nHost: 127.0.0.1\r\nX-APC-Token: tökén\r\n"
+        "Content-Length: 2\r\nConnection: close\r\n\r\n{}".encode("latin-1"),
+    )
+    assert status == 401
+    assert request(server, "/v1/health")[0] == 200, "the server survived"
+
+
+def test_a_missing_token_file_yields_401(server, apc_home):
+    """Deleting the token mid-run must answer 401, never a traceback."""
+    (apc_home / "token").unlink()
+    status, _, _ = request(
+        server, "/v1/prompts", method="POST", body=BROWSER, token=server["token"]
+    )
+    assert status == 401
+    assert request(server, "/v1/health")[0] == 200
+
+
+def test_an_unreadable_token_yields_401(server, monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(server["config"], "get_token", boom)
+    status, _, _ = request(
+        server, "/v1/prompts", method="POST", body=BROWSER, token=server["token"]
+    )
+    assert status == 401
+
+
+def test_cors_still_only_answers_extension_origins(server):
+    for origin in ("https://claude.ai", "https://evil.example", "null", "http://localhost:3000"):
+        _, headers, _ = request(server, "/v1/health", origin=origin)
+        assert "Access-Control-Allow-Origin" not in headers, origin
+    for origin in ("chrome-extension://abc", "moz-extension://abc"):
+        _, headers, _ = request(server, "/v1/health", origin=origin)
+        assert headers.get("Access-Control-Allow-Origin") == origin

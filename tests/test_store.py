@@ -283,3 +283,124 @@ def test_sessions_use_turn_end_for_last_ts(store):
         )
     )
     assert store.sessions()[0]["last_ts"] == "2026-09-19T10:20:00.000Z"
+
+
+# ---------------------------------------------------------------------------
+# regressions
+# ---------------------------------------------------------------------------
+
+
+def test_busy_timeout_is_set(store):
+    """Two processes write this database; a locked writer must wait, not raise."""
+    from agent_prompt_capture.store import BUSY_TIMEOUT_MS
+
+    assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == BUSY_TIMEOUT_MS
+
+
+def test_two_connections_can_write_concurrently(apc_home):
+    """The hook process and the listener process both hold an open Store."""
+    first = Store(apc_home / "prompts.db")
+    second = Store(apc_home / "prompts.db")
+    try:
+        for index in range(25):
+            writer = first if index % 2 else second
+            assert writer.insert(make_record(f"prompt {index}", session_id=f"s{index}"))
+        assert first.count() == 25
+        assert second.count() == 25
+    finally:
+        first.close()
+        second.close()
+
+
+def test_a_reader_is_not_blocked_by_an_open_writer(apc_home):
+    writer = Store(apc_home / "prompts.db")
+    reader = Store(apc_home / "prompts.db")
+    try:
+        writer.insert(make_record("visible", session_id="s1"))
+        assert reader.count() == 1
+    finally:
+        writer.close()
+        reader.close()
+
+
+@pytest.mark.parametrize("order", ["asc", "desc", "ASC", "DESC"])
+def test_list_accepts_the_whitelisted_orders(store, order):
+    store.insert(make_record("a"))
+    assert store.list(order=order)
+
+
+@pytest.mark.parametrize(
+    "order",
+    ["ts; DROP TABLE prompts", "asc--", "1", "", "ascending", "desc, id"],
+)
+def test_list_rejects_any_other_order(store, order):
+    """``order`` is interpolated into SQL, so it must come from a closed set."""
+    with pytest.raises(ValueError, match="order must be one of"):
+        store.list(order=order)
+    assert store._conn.execute("SELECT count(*) FROM prompts").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("group_by", ["source; DROP TABLE prompts", "rowid", "1=1", ""])
+def test_stats_rejects_injection_attempts(store, group_by):
+    with pytest.raises(ValueError, match="group_by must be one of"):
+        store.stats(group_by=group_by)
+
+
+def test_source_filter_is_parameterised(store):
+    store.insert(make_record("a"))
+    assert store.list(source="claude_code' OR '1'='1") == []
+    assert store.count(source="claude_code' OR '1'='1") == 0
+
+
+def test_fts_follows_an_update(store):
+    """The update trigger must remove the old row from the index, not just add one."""
+    store.insert(make_record("findable haystack", id="u1"))
+    store._conn.execute("UPDATE prompts SET prompt='replaced needle' WHERE id='u1'")
+    store._conn.commit()
+    assert [r.id for r, _ in store.search("needle")] == ["u1"]
+    assert store.search("haystack") == []
+
+
+def test_marking_a_turn_end_does_not_disturb_the_search_index(store):
+    store.insert(make_record("searchable text", id="t1", session_id="s1"))
+    store.mark_turn_end(Source.CLAUDE_CODE, "s1", "2026-09-19T10:05:00.000Z")
+    hits = store.search("searchable")
+    assert [r.id for r, _ in hits] == ["t1"]
+    assert len(hits) == 1
+
+
+def test_migrating_a_v1_database_rebuilds_the_search_index(apc_home):
+    """A v1 file may carry rows indexed before the triggers existed."""
+    import sqlite3
+
+    path = apc_home / "prompts.db"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE prompts (
+          id TEXT PRIMARY KEY, ts TEXT NOT NULL, source TEXT NOT NULL, prompt TEXT NOT NULL,
+          prompt_hash TEXT NOT NULL, session_id TEXT, account TEXT, cwd TEXT, project TEXT,
+          char_count INTEGER NOT NULL, pii_findings TEXT NOT NULL DEFAULT '{}',
+          metadata TEXT NOT NULL DEFAULT '{}');
+        CREATE VIRTUAL TABLE prompts_fts
+          USING fts5(prompt, content='prompts', content_rowid='rowid');
+        CREATE TABLE schema_version (version INTEGER NOT NULL);
+        INSERT INTO schema_version(version) VALUES (1);
+        """
+    )
+    connection.execute(
+        "INSERT INTO prompts (id, ts, source, prompt, prompt_hash, char_count)"
+        " VALUES ('old', '2026-09-19T10:00:00.000Z', 'claude_code', 'legacy needle', 'h', 13)"
+    )
+    connection.commit()
+    connection.close()
+
+    upgraded = Store(path)
+    try:
+        assert upgraded.schema_version == SCHEMA_VERSION
+        assert upgraded.get("old") is not None
+        assert upgraded.get("old").turn_end_ts is None
+        assert [r.id for r, _ in upgraded.search("needle")] == ["old"]
+        assert upgraded.mark_turn_end(Source.CLAUDE_CODE, None) is None
+    finally:
+        upgraded.close()

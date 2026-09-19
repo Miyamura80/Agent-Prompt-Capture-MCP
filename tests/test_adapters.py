@@ -320,3 +320,97 @@ def test_browser_empty_prompt():
 )
 def test_strip_url(raw, expected):
     assert browser_adapter.strip_url(raw) == expected
+
+
+# ---------------------------------------------------------------------------
+# regressions
+# ---------------------------------------------------------------------------
+
+
+def test_opencode_keeps_the_attachment_count_and_message_id():
+    """The plugin sends both (hook-specs.md §5); dropping them loses image-only turns."""
+    parsed = oc.parse(
+        {
+            "session_id": "ses_1",
+            "prompt": "look at this",
+            "messageID": "msg-7",
+            "attachments": 2,
+        }
+    )
+    assert parsed.metadata["messageID"] == "msg-7"
+    assert parsed.metadata["attachments"] == 2
+    assert isinstance(parsed.metadata["attachments"], int)
+
+
+def test_opencode_attachment_count_of_zero_is_recorded():
+    parsed = oc.parse({"session_id": "s", "prompt": "hi", "attachments": 0})
+    assert parsed.metadata["attachments"] == 0
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(["a", "b"], 2), ("3", 3), (None, None), ("many", None), (True, None), (-1, None)],
+)
+def test_opencode_attachment_count_coercion(value, expected):
+    parsed = oc.parse({"session_id": "s", "prompt": "hi", "attachments": value})
+    assert parsed.metadata.get("attachments") == expected
+
+
+@pytest.mark.parametrize("payload", [None, [], "text", 7, 1.5, True, ()])
+def test_every_adapter_rejects_non_dict_payloads(payload):
+    for parse in (cc.parse, codex_adapter.parse, oc.parse):
+        with pytest.raises(AdapterError):
+            parse(payload)
+    with pytest.raises(AdapterError):
+        browser_adapter.parse(payload, source=Source.CLAUDE_WEB)
+
+
+def test_adapters_tolerate_an_enormous_prompt():
+    """Capping is ingest's job, but no adapter may choke on the size."""
+    huge = "x" * 500_000
+    assert len(cc.parse({"hook_event_name": "UserPromptSubmit", "prompt": huge}).prompt)
+    assert len(oc.parse({"prompt": huge, "session_id": "s"}).prompt) == 500_000
+
+
+#: Verbatim JSON emitted by opencode-plugin/agent-prompt-capture.js, captured by
+#: driving the real plugin under node with a stub `apc` on PATH.
+OPENCODE_PLUGIN_PAYLOAD = {
+    "session_id": "sess-1",
+    "cwd": "/Users/alice/dev/proj",
+    "project": "my-project",
+    "model": "anthropic/claude-opus-5",
+    "agent": "build",
+    "prompt": "real user text",
+    "ts": "2025-09-19T20:05:45.678Z",
+    "messageID": "msg-1",
+    "attachments": 1,
+}
+
+OPENCODE_PLUGIN_TURN_END = {
+    "event": "turn_end",
+    "session_id": "sess-1",
+    "ts": "2026-09-19T21:10:52.985Z",
+}
+
+
+def test_the_real_plugin_payload_round_trips():
+    parsed = oc.parse(OPENCODE_PLUGIN_PAYLOAD)
+    assert isinstance(parsed, RawPrompt)
+    assert parsed.prompt == "real user text"
+    assert parsed.session_id == "sess-1"
+    assert parsed.cwd == "/Users/alice/dev/proj"
+    assert parsed.project == "my-project"
+    assert parsed.ts == "2025-09-19T20:05:45.678Z"
+    assert parsed.metadata == {
+        "model": "anthropic/claude-opus-5",
+        "agent": "build",
+        "messageID": "msg-1",
+        "attachments": 1,
+    }
+
+
+def test_the_real_plugin_turn_end_round_trips():
+    parsed = oc.parse(OPENCODE_PLUGIN_TURN_END)
+    assert isinstance(parsed, RawTurnEnd)
+    assert parsed.session_id == "sess-1"
+    assert parsed.ts == "2026-09-19T21:10:52.985Z"

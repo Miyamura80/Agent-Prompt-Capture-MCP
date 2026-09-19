@@ -15,14 +15,26 @@ from .models import PromptRecord, Source
 from .timeutil import parse_dt as _parse_dt
 from .timeutil import parse_time
 
-__all__ = ["Store", "SCHEMA_VERSION", "DEFAULT_DB_PATH", "GROUP_BY_CHOICES"]
+__all__ = [
+    "Store",
+    "SCHEMA_VERSION",
+    "DEFAULT_DB_PATH",
+    "GROUP_BY_CHOICES",
+    "ORDER_CHOICES",
+    "BUSY_TIMEOUT_MS",
+]
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_DB_PATH = db_path()
 
 GROUP_BY_CHOICES = ("source", "day", "week", "project", "account", "session")
+ORDER_CHOICES = ("asc", "desc")
 
 DEDUP_WINDOW_SECONDS = 5.0
+
+#: Two processes write this database (the capture hook and the HTTP listener), so a
+#: writer that finds the lock held must wait rather than raise ``database is locked``.
+BUSY_TIMEOUT_MS = 5000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS prompts (
@@ -89,8 +101,11 @@ class Store:
         self.path = Path(path) if path is not None else db_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        self._conn = sqlite3.connect(
+            str(self.path), check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000.0
+        )
         self._conn.row_factory = sqlite3.Row
+        self._conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
@@ -118,9 +133,11 @@ class Store:
 
     def _apply_migrations(self, from_version: int) -> None:
         """Version-to-version migrations. v0 -> v1 is the initial schema itself."""
-        # Future migrations go here, e.g.:
-        #   if from_version < 2: self._conn.execute("ALTER TABLE ...")
-        _ = from_version
+        if 0 < from_version < 2:
+            # v1 databases predate ``turn_end_ts`` (added by ``_ensure_columns`` above)
+            # and may carry an FTS index built before the update/delete triggers
+            # existed. Rebuilding is cheap and leaves search correct after the upgrade.
+            self._conn.execute("INSERT INTO prompts_fts(prompts_fts) VALUES('rebuild')")
 
     @property
     def schema_version(self) -> int:
@@ -299,7 +316,12 @@ class Store:
             account=account,
         )
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        direction = "ASC" if str(order).lower() == "asc" else "DESC"
+        # Never interpolate a caller-supplied string into SQL: map it through a
+        # closed whitelist and reject anything that is not in it.
+        key = str(order).lower().strip()
+        if key not in ORDER_CHOICES:
+            raise ValueError(f"order must be one of {', '.join(ORDER_CHOICES)}, got {order!r}")
+        direction = "ASC" if key == "asc" else "DESC"
         sql = f"SELECT * FROM prompts {where} ORDER BY ts {direction}, id {direction}"
         if limit is not None and int(limit) >= 0:
             sql += " LIMIT ? OFFSET ?"

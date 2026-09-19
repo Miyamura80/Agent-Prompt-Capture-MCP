@@ -23,10 +23,8 @@ POSITIVES: list[tuple[str, str, str, str]] = [
     ("phone local 7", "call 555-2671 now", "phone", "555-2671"),
     ("ipv4", "host at 192.168.10.42 down", "ipv4", "192.168.10.42"),
     ("ipv4 public", "ping 8.8.4.4 ok", "ipv4", "8.8.4.4"),
-    ("ipv4 loopback", "bound to 127.0.0.1 here", "ipv4", "127.0.0.1"),
     ("ipv6 full", "addr 2001:0db8:85a3:0000:0000:8a2e:0370:7334 up", "ipv6", "8a2e"),
     ("ipv6 compressed", "addr fe80::1ff:fe23:4567:890a up", "ipv6", "fe80::"),
-    ("ipv6 loopback", "listen on ::1 please", "ipv6", "::1"),
     ("mac colon", "nic 00:1b:44:11:3a:b7 up", "mac_address", "00:1b:44:11:3a:b7"),
     ("mac dash", "nic 00-1B-44-11-3A-B7 up", "mac_address", "00-1B-44-11-3A-B7"),
     ("ssn", "ssn 123-45-6789 on file", "ssn", "123-45-6789"),
@@ -72,6 +70,61 @@ POSITIVES: list[tuple[str, str, str, str]] = [
         "url_credentials",
         "dbuser:dbpass",
     ),
+    (
+        "stripe secret",
+        "key " + "sk_live_" + "51HabcdefghijklmnopqrstuvA" + " set",
+        "api_key",
+        "sk_live_",
+    ),
+    (
+        "stripe publishable",
+        "key " + "pk_live_" + "51Habcdefghijklmnopqrstuv" + " set",
+        "api_key",
+        "pk_live_",
+    ),
+    (
+        "twilio sid",
+        "sid " + "AC" + "1234567890abcdef1234567890abcdef" + " ok",
+        "api_key",
+        "AC12345678",
+    ),
+    (
+        "sendgrid",
+        "key " + "SG." + "abcdefghijklmnopqrstuv.abcdefghijklmnopqrstuvwxyz1234567890AB" + " ok",
+        "api_key",
+        "SG.abcdefghijklmnopqrstuv",
+    ),
+    ("google oauth", "tok ya29.a0AfH6SMBx1234567890abcdefghijklmnop ok", "api_key", "ya29."),
+    ("prefixed password", "DB_PASSWORD = 's3cret-value'", "api_key", "s3cret-value"),
+    ("prefixed secret", "STRIPE_SECRET=supersecretvalue123", "api_key", "supersecretvalue123"),
+    ("x auth token header", "X-Auth-Token: abcdef123456", "api_key", "abcdef123456"),
+    (
+        "slack webhook",
+        "post to https://hooks.slack.com/"
+        + "services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX",
+        "webhook_url",
+        "T00000000",
+    ),
+    (
+        "discord webhook",
+        "post to https://discord.com/api/" + "webhooks/123456789012345678/abcdefgh_ijklmnop",
+        "webhook_url",
+        "abcdefgh_ijklmnop",
+    ),
+    (
+        "ssh public key",
+        "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7vbqajDhA5Vd0123456789abcdefgh alice@laptop",
+        "ssh_key",
+        "AAAAB3NzaC1yc2E",
+    ),
+    (
+        "ssh ed25519 key",
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBabcdefghijklmnopqrstuvwxyz0123",
+        "ssh_key",
+        "AAAAC3NzaC1lZDI1",
+    ),
+    ("uk postcode", "ship to 12 Baker Street, London NW1 6XE", "uk_postcode", "NW1 6XE"),
+    ("ipv6 zone id", "ping fe80::1ff:fe23:4567:890a%eth0 now", "ipv6", "eth0"),
     ("home path macos", "open /Users/alice/dev/proj", "home_path", "/Users/alice"),
     ("home path linux", "open /home/bob/dev/proj", "home_path", "/home/bob"),
     ("home path windows", r"open C:\Users\carol\dev", "home_path", r"C:\Users\carol"),
@@ -111,6 +164,20 @@ NEGATIVES: list[tuple[str, str]] = [
     ("date slashes", "due 09/19/2026 sharp"),
     ("port number", "serving on port 3000 now"),
     ("localhost port", "open localhost:3000 in the browser"),
+    ("loopback ipv4 url", "curl http://127.0.0.1:8000/v1/health"),
+    ("loopback ipv4 bare", "bound to 127.0.0.1 here"),
+    ("loopback ipv4 high octet", "bound to 127.1.2.3 here"),
+    ("bind all address", "serving on 0.0.0.0:8080 now"),
+    ("bind all bare", "listen 0.0.0.0 everywhere"),
+    ("loopback ipv6", "listen on ::1 please"),
+    ("loopback ipv6 bracketed", "open http://[::1]:3000 now"),
+    ("loopback ipv6 expanded", "listen on 0:0:0:0:0:0:0:1 please"),
+    ("unspecified ipv6", "bind to :: for all"),
+    ("unix timestamp", "the timestamp was 1758312345 exactly"),
+    ("unix timestamp ms", "the timestamp was 1758312345678 exactly"),
+    ("cjk", "このプロンプトは変更されない 中文测试 한국어 테스트"),
+    ("lowercase postcode", "the variable nw1 6xe is not a postcode"),
+    ("ssh command", "run ssh-keygen -t ed25519 -C you@example"),
     ("hex colour", "background is #ff00aa today"),
     ("hex colour short", "use #fff for the border"),
     ("cpp scope", "call std::vector<int>::size here"),
@@ -311,3 +378,106 @@ def test_four_part_version_is_indistinguishable_from_an_ipv4():
 def test_scrub_path_is_idempotent():
     once = scrub_path("/Users/alice/dev")
     assert scrub_path(once) == once
+
+
+# ---------------------------------------------------------------------------
+# regressions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "11111111-2222-3333-4444-555555555555",
+        "550e8400-e29b-41d4-a716-446655440000",
+        "GET https://claude.ai/chat/11111111-2222-3333-4444-555555555555 now",
+        "conversation_id=11111111-2222-3333-4444-555555555555&x=1",
+        "see /tmp/11111111-2222-3333-4444-555555555555.jsonl for the transcript",
+        "revert 9f8b2c1d4e5a6b7c8d9e0f1a2b3c4d5e6f708192 please",
+        "revert 1234567890123456789012345678901234567890 please",
+        "id 4111111111111111-suffix stays",
+        "key prefix-4111111111111111 stays",
+    ],
+)
+def test_identifiers_are_never_mistaken_for_a_card(text):
+    """A UUID's tail (``-4444-555555555555``) is 16 digits and Luhn-valid.
+
+    Every browser ``conversation_id`` is a UUID and becomes our ``session_id``, so a
+    card false positive here silently corrupts stored session ids.
+    """
+    result = scrub(text)
+    assert result.text == text, f"text was modified -> {result.text}"
+    assert "credit_card" not in result.findings
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "card 4111111111111111 charged",
+        "card 4111 1111 1111 1111 ok",
+        "card 4111-1111-1111-1111 ok",
+        "card 5555-5555-5555-4444 ok",
+    ],
+)
+def test_a_standalone_card_is_still_caught(text):
+    result = scrub(text)
+    assert result.findings.get("credit_card") == 1
+    assert "4111" not in result.text
+    assert "5555" not in result.text
+
+
+def test_uuid_survives_alongside_real_pii():
+    text = "session 550e8400-e29b-41d4-a716-446655440000 for alice@example.com"
+    result = scrub(text)
+    assert "550e8400-e29b-41d4-a716-446655440000" in result.text
+    assert result.findings == {"email": 1}
+
+
+def test_loopback_survives_but_private_addresses_do_not():
+    text = "curl http://127.0.0.1:8000/ then http://192.168.1.50:8000/"
+    result = scrub(text)
+    assert "127.0.0.1:8000" in result.text
+    assert "192.168.1.50" not in result.text
+    assert result.findings == {"ipv4": 1}
+
+
+def test_localhost_and_bind_all_with_ports_survive():
+    text = "listening on localhost:3000, 0.0.0.0:8080 and [::1]:5432"
+    assert scrub(text).text == text
+
+
+def test_new_categories_are_all_wired_into_scrub():
+    """Every name in CATEGORIES must be reachable, or the docs lie about it."""
+    from agent_prompt_capture.pii import CATEGORIES
+
+    samples = {
+        "ssh_key": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQC7vbqajDhA5Vd01234567 me@host",
+        "webhook_url": "https://hooks.slack.com/services/T0/B0/XXXXXXXXXXXXXXXXXXXXXXXX",
+        "uk_postcode": "London NW1 6XE",
+    }
+    for category, text in samples.items():
+        assert category in CATEGORIES
+        assert category in scrub(text).findings, f"{category} is listed but never fires"
+
+
+def test_placeholder_numbering_is_stable_left_to_right():
+    result = scrub("b@x.com then a@x.com then b@x.com again")
+    assert result.text == "[EMAIL_1] then [EMAIL_2] then [EMAIL_1] again"
+
+
+def test_overlapping_spans_resolve_to_the_outermost_match():
+    """``url_credentials`` starts before the key inside it, so it wins the whole span."""
+    result = scrub("git remote add origin https://u:ghp_AAAAbbbbCCCCddddEEEE@github.com/o/r")
+    assert result.text.endswith("@github.com/o/r")
+    assert "ghp_" not in result.text
+    assert result.findings == {"url_credentials": 1}
+
+
+def test_long_input_is_not_pathological():
+    import time
+
+    text = ("refactor the module and call alice@example.com about it\n" * 4000)[:200_000]
+    started = time.monotonic()
+    result = scrub(text)
+    assert time.monotonic() - started < 5.0
+    assert "[EMAIL_1]" in result.text

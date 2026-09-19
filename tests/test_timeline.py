@@ -18,6 +18,8 @@ Global activity sessions:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from helpers import make_record
 
@@ -32,6 +34,7 @@ from agent_prompt_capture.timeline import (
     time_summary,
     top_terms,
 )
+from agent_prompt_capture.timeutil import to_iso
 
 DAY = "2026-09-19"
 
@@ -351,3 +354,202 @@ def test_other_sources_are_included(store, cfg):
     store.insert(make_record("b", ts=at("09:10"), source=Source.CHATGPT_WEB, project="y"))
     summary = time_summary(store, config=cfg, since=at("00:00"), group_by="source")
     assert {g["key"] for g in summary["groups"]} == {"opencode", "chatgpt_web"}
+
+
+# ---------------------------------------------------------------------------
+# regressions
+# ---------------------------------------------------------------------------
+
+
+def test_a_turn_end_before_its_prompt_never_yields_negative_time(store, cfg):
+    """Clock skew between the Stop hook and the prompt writer must not go negative."""
+    store.insert(
+        make_record(
+            "skewed turn",
+            ts=at("10:00"),
+            turn_end_ts=at("09:50"),  # earlier than ts
+            project="alpha",
+            session_id="skew",
+        )
+    )
+    records = store.list(order="asc")
+    assert agent_seconds(records[0]) is None
+
+    sessions = build_activity_sessions(records, idle_gap_minutes=30.0, tail_minutes=5.0)
+    assert all(session.active_minutes >= 0 for session in sessions)
+    assert sessions[0].end >= sessions[0].start
+
+    summary = time_summary(store, config=cfg, since=at("00:00"), group_by="project")
+    assert summary["total_active_minutes"] >= 0
+    assert all(group["active_minutes"] >= 0 for group in summary["groups"])
+    assert all(group["agent_minutes"] >= 0 for group in summary["groups"])
+
+
+def test_skew_does_not_split_an_activity_session(store):
+    store.insert(make_record("a", ts=at("10:00"), turn_end_ts=at("09:00"), session_id="s"))
+    store.insert(make_record("b", ts=at("10:05"), session_id="s"))
+    sessions = build_activity_sessions(store.list(order="asc"), idle_gap_minutes=30.0)
+    assert len(sessions) == 1
+
+
+def test_an_open_prompt_at_the_end_of_the_range_is_still_credited(loaded, cfg):
+    """The last fixture prompt has no turn end; it must not vanish or go negative."""
+    summary = time_summary(store=loaded, config=cfg, since=at("11:10"), group_by="project")
+    assert summary["groups"]
+    assert summary["total_active_minutes"] == 5.0  # tail only: one open prompt
+    assert summary["groups"][0]["prompt_count"] == 1
+    assert summary["groups"][0]["agent_minutes"] == 0.0
+    assert summary["groups"][0]["avg_think_seconds"] is None
+
+
+def test_a_session_straddling_the_since_boundary_is_truncated_not_broken(loaded, cfg):
+    """Only rows inside the window exist, so the session is clipped - never negative."""
+    summary = time_summary(store=loaded, config=cfg, since=at("09:15"), group_by="project")
+    assert summary["total_active_minutes"] > 0
+    assert summary["context_switches"] >= 0
+    keys = {group["key"] for group in summary["groups"]}
+    assert "beta" in keys
+
+
+def test_empty_store_returns_well_formed_zeros(store, cfg):
+    summary = time_summary(store, config=cfg, since="7d", group_by="project")
+    assert summary["groups"] == []
+    assert summary["total_active_minutes"] == 0
+    assert summary["context_switches"] == 0
+
+    timeline = activity_timeline(store, config=cfg, since="24h", bucket="hour")
+    assert all(bucket["prompt_count"] == 0 for bucket in timeline["buckets"])
+    assert all(bucket["active_minutes"] == 0.0 for bucket in timeline["buckets"])
+
+    digest = daily_digest(store, config=cfg, date=DAY)
+    assert digest["active_minutes"] == 0
+    assert digest["prompt_count"] == 0
+    assert digest["sessions"] == []
+    assert digest["top_terms"] == []
+    assert digest["first_activity"] is None
+    assert digest["last_activity"] is None
+    assert digest["context_switches"] == 0
+
+
+def test_activity_timeline_buckets_are_contiguous_and_cover_every_prompt(loaded, cfg):
+    timeline = activity_timeline(
+        loaded, config=cfg, since=at("08:00"), until=at("13:00"), bucket="hour"
+    )
+    buckets = timeline["buckets"]
+    assert sum(bucket["prompt_count"] for bucket in buckets) == len(FIXTURE)
+    starts = [bucket["start"] for bucket in buckets]
+    assert starts == sorted(starts)
+    assert len(set(starts)) == len(starts)
+
+
+def test_activity_timeline_is_not_quadratic(store, cfg):
+    """50k rows x a year of daily buckets must not be rows x buckets work."""
+    import time
+
+    base = 1_758_000_000  # epoch seconds, arbitrary
+    rows = []
+    for index in range(50_000):
+        moment = datetime.fromtimestamp(base + index * 600, tz=UTC)
+        rows.append(
+            (
+                f"id-{index}",
+                to_iso(moment),
+                "claude_code",
+                f"prompt number {index}",
+                "hash",
+                "s1",
+                None,
+                None,
+                "proj",
+                10,
+                "{}",
+                "{}",
+                to_iso(moment + timedelta(seconds=60)),
+            )
+        )
+    store._conn.executemany(
+        "INSERT INTO prompts (id, ts, source, prompt, prompt_hash, session_id, account, cwd,"
+        " project, char_count, pii_findings, metadata, turn_end_ts)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        rows,
+    )
+    store._conn.commit()
+
+    started = time.monotonic()
+    timeline = activity_timeline(
+        store,
+        config=cfg,
+        since=to_iso(datetime.fromtimestamp(base, tz=UTC)),
+        until=to_iso(datetime.fromtimestamp(base + 50_000 * 600, tz=UTC)),
+        bucket="day",
+    )
+    elapsed = time.monotonic() - started
+    assert sum(b["prompt_count"] for b in timeline["buckets"]) == 50_000
+    assert elapsed < 20.0, f"activity_timeline took {elapsed:.1f}s on 50k rows"
+
+    started = time.monotonic()
+    summary = time_summary(store, config=cfg, since="10y", group_by="day")
+    assert time.monotonic() - started < 20.0
+    assert summary["total_active_minutes"] > 0
+
+
+def test_activity_timeline_truncates_instead_of_looping_forever(store, cfg):
+    from agent_prompt_capture.timeline import MAX_TIMELINE_BUCKETS
+
+    timeline = activity_timeline(store, config=cfg, since="10y", bucket="hour")
+    assert len(timeline["buckets"]) <= MAX_TIMELINE_BUCKETS
+    assert timeline.get("truncated") is True
+
+
+# -- local time / DST -------------------------------------------------------
+
+
+@pytest.fixture
+def new_york(monkeypatch):
+    """A zone with DST, so a fixed UTC offset is provably the wrong answer."""
+    import time as time_mod
+
+    monkeypatch.setenv("TZ", "America/New_York")
+    time_mod.tzset()
+    yield
+    monkeypatch.undo()
+    time_mod.tzset()
+
+
+def test_local_helpers_follow_dst(new_york):
+    from agent_prompt_capture.timeline import from_local, to_local
+
+    # EST (UTC-5) in January, EDT (UTC-4) in July.
+    assert to_local(datetime(2026, 1, 15, 12, tzinfo=UTC)).hour == 7
+    assert to_local(datetime(2026, 7, 15, 12, tzinfo=UTC)).hour == 8
+    assert from_local(datetime(2026, 1, 15)) == datetime(2026, 1, 15, 5, tzinfo=UTC)
+    assert from_local(datetime(2026, 7, 15)) == datetime(2026, 7, 15, 4, tzinfo=UTC)
+    # The autumn transition makes a 25-hour local day.
+    day = from_local(datetime(2026, 11, 2)) - from_local(datetime(2026, 11, 1))
+    assert day == timedelta(hours=25)
+
+
+def test_hour_of_day_uses_the_offset_in_force_at_that_instant(store, cfg, new_york):
+    """A fixed 'now' offset mislabels timestamps from the other side of a DST change."""
+    store.insert(make_record("winter work", ts="2026-01-15T12:00:00.000Z", session_id="w"))
+    store.insert(make_record("summer work", ts="2026-07-15T12:00:00.000Z", session_id="s"))
+    summary = time_summary(store, config=cfg, since="10y", group_by="hour_of_day")
+    keys = {group["key"] for group in summary["groups"] if group["prompt_count"]}
+    assert keys == {"07", "08"}
+
+
+def test_daily_digest_uses_local_midnight_boundaries(store, cfg, new_york):
+    """23:30 local on the 15th is 03:30 UTC on the 16th; it belongs to the 15th."""
+    store.insert(make_record("late night", ts="2026-07-16T03:30:00.000Z", session_id="n"))
+    store.insert(make_record("next morning", ts="2026-07-16T13:00:00.000Z", session_id="m"))
+    fifteenth = daily_digest(store, config=cfg, date="2026-07-15")
+    sixteenth = daily_digest(store, config=cfg, date="2026-07-16")
+    assert fifteenth["prompt_count"] == 1
+    assert sixteenth["prompt_count"] == 1
+
+
+def test_daily_digest_does_not_double_count_the_midnight_boundary(store, cfg, new_york):
+    """``until`` is inclusive in the store, so exact local midnight must land once."""
+    store.insert(make_record("on the stroke", ts="2026-07-16T04:00:00.000Z", session_id="x"))
+    assert daily_digest(store, config=cfg, date="2026-07-15")["prompt_count"] == 0
+    assert daily_digest(store, config=cfg, date="2026-07-16")["prompt_count"] == 1

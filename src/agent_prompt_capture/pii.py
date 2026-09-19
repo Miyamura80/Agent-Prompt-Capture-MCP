@@ -16,14 +16,20 @@ import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 
-__all__ = ["ScrubResult", "scrub", "scrub_path", "CATEGORIES", "luhn_ok"]
+__all__ = ["ScrubResult", "scrub", "scrub_path", "CATEGORIES", "luhn_ok", "MAX_SCRUB_CHARS"]
+
+#: Prompts longer than this are truncated before scrubbing. A 200k-character paste is
+#: already pathological, and the span machinery is O(patterns x text).
+MAX_SCRUB_CHARS = 200_000
 
 _log = logging.getLogger("agent_prompt_capture")
 
 #: Category names in application order, most specific first.
 CATEGORIES: tuple[str, ...] = (
     "private_key",
+    "ssh_key",
     "jwt",
+    "webhook_url",
     "api_key",
     "url_credentials",
     "credit_card",
@@ -34,6 +40,7 @@ CATEGORIES: tuple[str, ...] = (
     "ipv6",
     "ipv4",
     "mac_address",
+    "uk_postcode",
     "home_path",
     "user_term",
     "custom",
@@ -108,15 +115,38 @@ def _phone_ok(text: str) -> bool:
 
 
 def _ipv4_ok(text: str) -> bool:
+    """A dotted quad worth redacting.
+
+    Loopback (``127.0.0.0/8``) and the unspecified/bind-all address (``0.0.0.0``)
+    are deliberately **kept**: they identify nobody and no network, and redacting
+    them mangles everyday developer text such as ``curl http://127.0.0.1:8000/``.
+    Everything else, private ranges included, is redacted.
+    """
     parts = text.split(".")
     if len(parts) != 4:
         return False
-    return all(p.isdigit() and len(p) <= 3 and int(p) <= 255 for p in parts)
+    if not all(p.isdigit() and len(p) <= 3 and int(p) <= 255 for p in parts):
+        return False
+    if int(parts[0]) == 127:  # 127.0.0.0/8 loopback
+        return False
+    return any(int(p) for p in parts)  # 0.0.0.0 is the unspecified address
 
 
 def _ipv6_ok(text: str) -> bool:
+    """Same rule as :func:`_ipv4_ok`: keep ``::1`` and ``::``, redact the rest."""
+    core = text.split("%", 1)[0]
     # ``::`` on its own carries no address; require at least one hex digit.
-    return any(c in "0123456789abcdefABCDEF" for c in text)
+    if not any(c in "0123456789abcdefABCDEF" for c in core):
+        return False
+    groups = [g for g in core.replace("::", ":").split(":") if g]
+    if not groups:  # pragma: no cover - defensive, the check above covers it
+        return False
+    try:
+        values = [int(g, 16) for g in groups]
+    except ValueError:  # pragma: no cover - defensive
+        return False
+    # ::1 / 0:0:0:0:0:0:0:1 loopback and the unspecified address.
+    return not (all(v == 0 for v in values[:-1]) and values[-1] in (0, 1))
 
 
 # --------------------------------------------------------------------------
@@ -126,14 +156,39 @@ def _ipv6_ok(text: str) -> bool:
 _HEX = "[0-9A-Fa-f]"
 
 PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----.*?-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----",
+    r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY(?: BLOCK)?-----"
+    r".*?"
+    r"-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY(?: BLOCK)?-----",
     re.DOTALL,
+)
+
+#: An ``authorized_keys`` / ``id_*.pub`` line. The trailing comment is only swallowed
+#: when it looks like ``user@host``, so ordinary prose after a key survives.
+SSH_KEY_RE = re.compile(
+    r"(?:ssh-(?:rsa|dss|ed25519)|ecdsa-sha2-nistp(?:256|384|521)"
+    r"|sk-(?:ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)"
+    r"[ \t]+AAAA[0-9A-Za-z+/]{20,}={0,3}"
+    r"(?:[ \t]+\S+@\S+)?"
 )
 
 JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}")
 
+#: Incoming-webhook URLs. The path *is* the credential, so the whole URL goes.
+WEBHOOK_URL_RE = re.compile(
+    r"(?i)https://(?:"
+    r"hooks\.slack\.com/(?:services|workflows|triggers)/"
+    r"|(?:canary\.|ptb\.)?discord(?:app)?\.com/api/webhooks/"
+    r"|[a-z0-9-]+\.webhook\.office\.com/webhookb2/"
+    r"|outlook\.office(?:365)?\.com/webhook/"
+    r"|chat\.googleapis\.com/v1/spaces/"
+    r"|discord\.com/api/v\d+/webhooks/"
+    r")[^\s<>\"')]+"
+)
+
 API_KEY_RES: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"\bsk-(?:ant|proj|or|live|test)?-?[A-Za-z0-9_-]{16,}"), 0),
+    # Stripe (and the many services that copied its ``<prefix>_<env>_<blob>`` shape).
+    (re.compile(r"\b[a-z]{2,4}_(?:live|test)_[A-Za-z0-9]{16,}"), 0),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), 0),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}"), 0),
     (re.compile(r"\bglpat-[A-Za-z0-9_-]{16,}"), 0),
@@ -141,14 +196,23 @@ API_KEY_RES: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), 0),
     (re.compile(r"\bASIA[0-9A-Z]{16}\b"), 0),
     (re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"), 0),
+    (re.compile(r"\bya29\.[0-9A-Za-z_-]{20,}"), 0),  # Google OAuth access token
+    (re.compile(r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"), 0),  # SendGrid
+    (re.compile(r"\bAC[0-9a-fA-F]{32}\b"), 0),  # Twilio account SID
+    (re.compile(r"\bSK[0-9a-fA-F]{32}\b"), 0),  # Twilio API key SID
     (re.compile(r"\bnpm_[A-Za-z0-9]{30,}"), 0),
     (re.compile(r"\bpypi-[A-Za-z0-9_-]{16,}"), 0),
     (re.compile(r"\bhf_[A-Za-z0-9]{20,}"), 0),
     (re.compile(r"\bBearer\s+([A-Za-z0-9._~+/=-]{12,})"), 1),
     (
+        # ``password = "x"`` and friends. The key name may carry a prefix
+        # (``DB_PASSWORD``, ``STRIPE_SECRET``, ``X-Auth-Token``), which the old
+        # ``\b`` anchor silently missed.
         re.compile(
-            r"(?i)\b(?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|secret|token"
-            r"|password|passwd)\b\s*[:=]\s*[\"']?([^\s\"',;)]{6,})[\"']?"
+            r"(?i)(?<![A-Za-z0-9])[A-Za-z0-9]*[_.-]?"
+            r"(?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|refresh[_-]?token"
+            r"|client[_-]?secret|secret|token|password|passwd|passphrase)"
+            r"\b\s*[:=]\s*[\"']?([^\s\"',;)]{6,})[\"']?"
         ),
         1,
     ),
@@ -156,7 +220,19 @@ API_KEY_RES: tuple[tuple[re.Pattern[str], int], ...] = (
 
 URL_CREDENTIALS_RE = re.compile(r"(?<=://)[^\s/:@]+:[^\s/@]+(?=@)")
 
-CREDIT_CARD_RE = re.compile(r"(?<![\d.])(?:\d[ -]?){12,18}\d(?![\d])")
+#: 13-19 digits, optionally grouped. The guards matter more than the pattern: without
+#: them the tail of a UUID (``...-4444-555555555555``) is 16 digits and Luhn-valid, and
+#: every browser ``conversation_id`` is a UUID that ends up as our ``session_id``.
+CREDIT_CARD_RE = re.compile(r"(?<![\w.-])(?:\d[ -]?){12,18}\d(?![\w-])")
+
+#: Anything inside a UUID is an identifier, never a card/phone/SSN/IBAN.
+UUID_RE = re.compile(
+    r"(?<![0-9A-Za-z-])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![0-9A-Za-z-])"
+)
+
+#: Categories that a UUID must never be mistaken for.
+_UUID_EXEMPT: frozenset[str] = frozenset({"credit_card", "phone", "ssn", "iban"})
 
 IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b")
 
@@ -183,12 +259,17 @@ IPV6_RE = re.compile(
     rf"|(?:{_HEX}{{1,4}}:){{1,2}}(?::{_HEX}{{1,4}}){{1,5}}"
     rf"|{_HEX}{{1,4}}:(?::{_HEX}{{1,4}}){{1,6}}"
     rf"|:(?:(?::{_HEX}{{1,4}}){{1,7}}|:)"
-    r")(?![\w:.])"
+    r")(?:%[A-Za-z0-9_.-]+)?(?![\w:.])"  # keep the zone id inside the placeholder
 )
 
 IPV4_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
 
 MAC_RE = re.compile(rf"(?<![\w:.-])(?:{_HEX}{{2}}[:-]){{5}}{_HEX}{{2}}(?![\w:.-])")
+
+#: A UK postcode in its canonical uppercase, space-separated form ("NW1 6XE").
+#: Uppercase-only and single-space-only on purpose: the lowercase/unspaced variants
+#: collide with far too many identifiers to be worth it.
+UK_POSTCODE_RE = re.compile(r"(?<![A-Za-z0-9])[A-Z]{1,2}\d[A-Z\d]? \d[A-Z]{2}(?![A-Za-z0-9])")
 
 HOME_PATH_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?<![\w])(/Users/|/home/)([^/\\\s:\"'<>|,;)]+)"),
@@ -318,6 +399,25 @@ def _custom_spans(text: str, patterns: Iterable[str]) -> list[_Span]:
     return spans
 
 
+def _drop_uuid_overlaps(spans: list[_Span], text: str) -> list[_Span]:
+    """Remove number-shaped candidates that fall inside a UUID.
+
+    A UUID is a machine identifier: its digit runs are not cards, phone numbers,
+    social security numbers or IBANs, however well they happen to check out.
+    """
+    if not any(span.category in _UUID_EXEMPT for span in spans):
+        return spans
+    regions = [match.span() for match in UUID_RE.finditer(text)]
+    if not regions:
+        return spans
+    return [
+        span
+        for span in spans
+        if span.category not in _UUID_EXEMPT
+        or not any(span.start < end and start < span.end for start, end in regions)
+    ]
+
+
 def _resolve(spans: Sequence[_Span]) -> list[_Span]:
     """Earliest span wins; on a tie the longest wins; then rule priority."""
     ordered = sorted(spans, key=lambda s: (s.start, -(s.end - s.start), s.priority))
@@ -438,7 +538,9 @@ def scrub(
     spans: list[_Span] = []
 
     _add(spans, text, PRIVATE_KEY_RE, "private_key")
+    _add(spans, text, SSH_KEY_RE, "ssh_key")
     _add(spans, text, JWT_RE, "jwt")
+    _add(spans, text, WEBHOOK_URL_RE, "webhook_url")
     for pattern, group in API_KEY_RES:
         _add(spans, text, pattern, "api_key", group=group)
     _add(spans, text, URL_CREDENTIALS_RE, "url_credentials")
@@ -450,12 +552,13 @@ def scrub(
     _add(spans, text, IPV6_RE, "ipv6", validator=_ipv6_ok)
     _add(spans, text, IPV4_RE, "ipv4", validator=_ipv4_ok)
     _add(spans, text, MAC_RE, "mac_address")
+    _add(spans, text, UK_POSTCODE_RE, "uk_postcode")
     spans.extend(_home_spans(text))
     spans.extend(_term_spans(text, extra_terms))
     spans.extend(_custom_spans(text, extra_patterns))
     if enable_ner:
         spans.extend(_ner_spans(text))
 
-    resolved = _resolve(spans)
+    resolved = _resolve(_drop_uuid_overlaps(spans, text))
     scrubbed, findings = _apply(text, resolved, {}, {})
     return ScrubResult(scrubbed, findings)

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from agent_prompt_capture.adapters import AdapterError
 from agent_prompt_capture.ingest import SOURCE_ALIASES, adapter_for, ingest
 from agent_prompt_capture.models import Source
+from agent_prompt_capture.timeutil import to_iso
 
 CLAUDE = {
     "session_id": "abc123",
@@ -258,3 +261,127 @@ def test_source_aliases(alias, expected):
 @pytest.mark.parametrize("source", list(Source))
 def test_every_source_has_an_adapter(source):
     assert callable(adapter_for(source))
+
+
+# ---------------------------------------------------------------------------
+# regressions
+# ---------------------------------------------------------------------------
+
+
+def test_a_huge_prompt_is_truncated_and_says_so(config, store):
+    from agent_prompt_capture.ingest import MAX_PROMPT_CHARS
+
+    payload = {**CLAUDE, "prompt": "x" * (MAX_PROMPT_CHARS + 5_000)}
+    record = ingest(Source.CLAUDE_CODE, payload, config=config, store=store)
+    assert record is not None
+    assert record.char_count == MAX_PROMPT_CHARS
+    assert record.metadata["prompt_truncated"] is True
+    assert record.metadata["prompt_original_chars"] == MAX_PROMPT_CHARS + 5_000
+
+
+def test_a_truncated_prompt_hashes_what_we_stored(config, store):
+    from agent_prompt_capture.ingest import MAX_PROMPT_CHARS
+
+    text = "y" * (MAX_PROMPT_CHARS + 10)
+    record = ingest(Source.CLAUDE_CODE, {**CLAUDE, "prompt": text}, config=config, store=store)
+    expected = hashlib.sha256(text[:MAX_PROMPT_CHARS].encode()).hexdigest()
+    assert record.prompt_hash == expected
+
+
+def test_a_normal_prompt_is_not_marked_truncated(config, store):
+    record = ingest(Source.CLAUDE_CODE, CLAUDE, config=config, store=store)
+    assert "prompt_truncated" not in record.metadata
+
+
+def test_a_huge_metadata_string_is_capped(config, store):
+    from agent_prompt_capture.ingest import MAX_METADATA_CHARS
+
+    payload = {**CLAUDE, "transcript_path": "/Users/alice/" + ("z" * 100_000)}
+    record = ingest(Source.CLAUDE_CODE, payload, config=config, store=store)
+    assert len(record.metadata["transcript_path"]) <= MAX_METADATA_CHARS + 32
+
+
+def test_every_metadata_string_is_scrubbed_including_nested_ones(config, store):
+    payload = {
+        **CLAUDE,
+        "prompt": "hello",
+        "agent_type": "mail alice@example.com now",
+        "prompt_id": "ring +14155552671",
+    }
+    record = ingest(Source.CLAUDE_CODE, payload, config=config, store=store)
+    blob = json.dumps(record.metadata)
+    assert "alice@example.com" not in blob
+    assert "+14155552671" not in blob
+
+
+def test_a_future_client_timestamp_is_distrusted(write_config, store):
+    """Browser payloads carry the browser's clock; a future ts poisons every window."""
+    from agent_prompt_capture.timeutil import parse_dt
+
+    config = write_config(ALLOWLIST)
+    future = to_iso(datetime.now(UTC) + timedelta(days=3))
+    record = ingest(Source.CLAUDE_WEB, {**BROWSER, "ts": future}, config=config, store=store)
+    assert record is not None
+    assert parse_dt(record.ts) <= datetime.now(UTC) + timedelta(seconds=5)
+    assert record.metadata["client_clock_skew"] is True
+    assert record.metadata["client_ts"] == future
+
+
+def test_a_slightly_fast_client_clock_is_accepted(write_config, store):
+    config = write_config(ALLOWLIST)
+    soon = to_iso(datetime.now(UTC) + timedelta(seconds=30))
+    record = ingest(Source.CLAUDE_WEB, {**BROWSER, "ts": soon}, config=config, store=store)
+    assert record.ts == soon
+    assert "client_clock_skew" not in record.metadata
+
+
+def test_a_past_client_timestamp_is_preserved(write_config, store):
+    """The extension replays a queue after an outage; those timestamps are real."""
+    config = write_config(ALLOWLIST)
+    past = to_iso(datetime.now(UTC) - timedelta(hours=6))
+    record = ingest(Source.CLAUDE_WEB, {**BROWSER, "ts": past}, config=config, store=store)
+    assert record.ts == past
+    assert "client_clock_skew" not in record.metadata
+
+
+def test_two_browser_fires_of_the_same_prompt_still_dedupe(write_config, store):
+    config = write_config(ALLOWLIST)
+    stamp = to_iso(datetime.now(UTC))
+    payload = {**BROWSER, "ts": stamp}
+    assert ingest(Source.CLAUDE_WEB, payload, config=config, store=store) is not None
+    assert ingest(Source.CLAUDE_WEB, payload, config=config, store=store) is None
+
+
+def test_a_uuid_conversation_id_survives_as_the_session_id(write_config, store):
+    """A UUID's digits are card-shaped; mangling them corrupts every browser session."""
+    config = write_config(ALLOWLIST)
+    conversation = "11111111-2222-3333-4444-555555555555"
+    record = ingest(
+        Source.CLAUDE_WEB,
+        {**BROWSER, "conversation_id": conversation},
+        config=config,
+        store=store,
+    )
+    assert record.session_id == conversation
+
+
+def test_a_turn_end_before_the_prompt_is_clamped(config, store):
+    payload = {
+        "type": "agent-turn-complete",
+        "thread-id": "t1",
+        "input-messages": ["do the thing"],
+        "ts": "2026-09-19T10:00:00.000Z",
+    }
+    record = ingest(Source.CODEX_CLI, payload, config=config, store=store)
+    assert record is not None
+    assert record.turn_end_ts >= record.ts
+
+
+@pytest.mark.parametrize("payload", [None, [], "a string", 42, True])
+@pytest.mark.parametrize(
+    "source",
+    [Source.CLAUDE_CODE, Source.CODEX_CLI, Source.OPENCODE, Source.CLAUDE_WEB],
+)
+def test_every_adapter_rejects_a_non_object_payload(config, store, source, payload):
+    with pytest.raises(AdapterError):
+        ingest(source, payload, config=config, store=store)

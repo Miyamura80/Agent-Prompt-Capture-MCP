@@ -103,9 +103,110 @@ async def test_list_prompts_filters(mcp):
 
 
 async def test_list_prompts_rejects_an_unknown_source(mcp):
+    """An unknown enum value is data, not an exception: the client gets the choices."""
     async with _client(mcp["server"]) as client:
         result = await client.call_tool("list_prompts", {"source": "banana"})
-    assert _is_error(result)
+    assert not _is_error(result)
+    payload = _payload(result)
+    assert payload["field"] == "source"
+    assert "banana" in payload["error"]
+    assert "claude_code" in payload["valid_values"]
+
+
+@pytest.mark.parametrize(
+    ("tool", "args", "field", "expected"),
+    [
+        ("list_prompts", {"source": "banana"}, "source", "claude_code"),
+        ("search_prompts", {"query": "x", "source": "banana"}, "source", "claude_code"),
+        ("list_sessions", {"source": "banana"}, "source", "claude_code"),
+        ("prompt_stats", {"group_by": "banana"}, "group_by", "source"),
+        ("time_summary", {"group_by": "banana"}, "group_by", "project"),
+        ("activity_timeline", {"bucket": "banana"}, "bucket", "hour"),
+    ],
+)
+async def test_invalid_enum_returns_structured_error(mcp, tool, args, field, expected):
+    async with _client(mcp["server"]) as client:
+        result = await client.call_tool(tool, args)
+    assert not _is_error(result), f"{tool} raised instead of returning an error object"
+    payload = _payload(result)
+    assert payload["field"] == field
+    assert expected in payload["valid_values"]
+    assert payload["hint"]
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("list_prompts", {"since": "not-a-time"}),
+        ("search_prompts", {"query": "x", "since": "not-a-time"}),
+        ("prompt_stats", {"since": "not-a-time"}),
+        ("time_summary", {"since": "not-a-time"}),
+        ("activity_timeline", {"since": "not-a-time"}),
+    ],
+)
+async def test_unparseable_since_returns_structured_error(mcp, tool, args):
+    async with _client(mcp["server"]) as client:
+        result = await client.call_tool(tool, args)
+    assert not _is_error(result)
+    payload = _payload(result)
+    assert "not-a-time" in payload["error"]
+    assert "24h" in payload["hint"]
+
+
+async def test_daily_digest_rejects_a_bad_date(mcp):
+    async with _client(mcp["server"]) as client:
+        result = await client.call_tool("daily_digest", {"date": "yesterday"})
+    assert not _is_error(result)
+    payload = _payload(result)
+    assert "yesterday" in payload["error"]
+    assert "YYYY-MM-DD" in payload["hint"]
+
+
+async def test_limit_is_clamped(mcp):
+    from agent_prompt_capture.mcp_server import MAX_LIMIT
+
+    async with _client(mcp["server"]) as client:
+        payload = _payload(await client.call_tool("list_prompts", {"limit": MAX_LIMIT * 100}))
+    assert payload["total"] == 3
+    assert len(payload["prompts"]) == 3
+
+
+async def test_instructions_cover_the_contract(mcp):
+    """The instructions are the only thing an LLM client reads before choosing a tool."""
+    from agent_prompt_capture.mcp_server import INSTRUCTIONS
+
+    lowered = INSTRUCTIONS.lower()
+    for needle in (
+        "time_summary",
+        "activity_timeline",
+        "daily_digest",
+        "search_prompts",
+        "list_prompts",
+        "[email_1]",
+        "active_minutes",
+        "agent_minutes",
+        "think time",
+        "context switch",
+        "heuristic",
+        "24h",
+        "7d",
+        "local timezone",
+    ):
+        assert needle in lowered, f"INSTRUCTIONS never mentions {needle!r}"
+
+
+async def test_every_tool_description_documents_its_enums(mcp):
+    async with _client(mcp["server"]) as client:
+        listed = await client.list_tools()
+    by_name = {tool.name: tool.description or "" for tool in listed.tools}
+    assert "claude_code" in by_name["list_prompts"]
+    assert "24h" in by_name["list_prompts"]
+    assert "week" in by_name["prompt_stats"]
+    assert "hour_of_day" in by_name["time_summary"]
+    assert "weekday" in by_name["time_summary"]
+    for word in ("hour", "day"):
+        assert word in by_name["activity_timeline"]
+    assert "YYYY-MM-DD" in by_name["daily_digest"]
 
 
 async def test_search_prompts(mcp):

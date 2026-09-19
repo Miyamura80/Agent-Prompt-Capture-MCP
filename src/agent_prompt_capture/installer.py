@@ -13,6 +13,7 @@ from .config import get_logger
 
 __all__ = [
     "install",
+    "ConfigFormatError",
     "uninstall",
     "TARGETS",
     "HOOK_COMMAND",
@@ -62,20 +63,31 @@ const ARGS = ["capture", "opencode"];
 
 function spawnDetached(json) {
   // Bun first (OpenCode's server runs on Bun), node:child_process otherwise.
+  let spawned = null;
   try {
     if (globalThis.Bun && typeof globalThis.Bun.spawn === "function") {
-      const child = globalThis.Bun.spawn([COMMAND, ...ARGS], {
+      // Bun.spawn throws synchronously when `apc` is not on PATH; that is the only
+      // reason to fall through to node. A failure AFTER the spawn must not retry,
+      // or one prompt is captured twice.
+      spawned = globalThis.Bun.spawn([COMMAND, ...ARGS], {
         stdin: "pipe",
         stdout: "ignore",
         stderr: "ignore",
       });
-      child.stdin.write(json);
-      child.stdin.end();
-      if (typeof child.unref === "function") child.unref();
-      return;
     }
   } catch (_) {
-    // fall through to node
+    spawned = null; // fall through to node
+  }
+
+  if (spawned) {
+    try {
+      spawned.stdin.write(json);
+      spawned.stdin.end();
+      if (typeof spawned.unref === "function") spawned.unref();
+    } catch (_) {
+      // the child died before it read us; nothing to salvage, never retry
+    }
+    return;
   }
 
   import("node:child_process")
@@ -84,9 +96,15 @@ function spawnDetached(json) {
         stdio: ["pipe", "ignore", "ignore"],
         detached: true,
       });
+      // A missing `apc` surfaces as an async "error" event, never a throw.
       child.on("error", () => {});
-      child.stdin.on("error", () => {});
-      child.stdin.end(json);
+      if (child.stdin) {
+        child.stdin.on("error", () => {});
+        // end() both writes and closes the pipe: that close, not unref(), is what
+        // lets the parent's event loop drain. unref() is belt and braces.
+        child.stdin.end(json);
+        if (typeof child.stdin.unref === "function") child.stdin.unref();
+      }
       child.unref();
     })
     .catch(() => {});
@@ -120,11 +138,30 @@ function attachmentCount(parts) {
 }
 
 function sessionIdOf(event) {
+  // session.idle carries `properties.sessionID`, but session.created/updated/deleted
+  // put the id at `properties.info.id` instead. Getting this wrong is the easiest
+  // mistake in the whole plugin (hook-specs.md 6.c).
   const props = (event && event.properties) || {};
   if (props.sessionID) return props.sessionID;
   if (props.info && props.info.id) return props.info.id;
   if (props.part && props.part.sessionID) return props.part.sessionID;
   return null;
+}
+
+// session.idle also fires for sub-sessions and for sessions that were already running
+// when this plugin loaded. We have no open turn for those, so emitting a turn end
+// would spawn a process for nothing. Remember the sessions we actually sent a prompt
+// for, bounded so a long-lived server cannot grow this without limit.
+const OPEN_SESSIONS = new Set();
+const MAX_OPEN_SESSIONS = 512;
+
+function rememberSession(sessionID) {
+  if (!sessionID) return;
+  if (OPEN_SESSIONS.size >= MAX_OPEN_SESSIONS) {
+    // Sets iterate in insertion order, so this drops the oldest.
+    OPEN_SESSIONS.delete(OPEN_SESSIONS.values().next().value);
+  }
+  OPEN_SESSIONS.add(sessionID);
 }
 
 export const AgentPromptCapture = async ({ project, client, $, directory, worktree }) => ({
@@ -140,8 +177,11 @@ export const AgentPromptCapture = async ({ project, client, $, directory, worktr
         ? `${input.model.providerID}/${input.model.modelID}`
         : null;
 
+      const sessionID = (input && input.sessionID) || message.sessionID || null;
+      rememberSession(sessionID);
+
       send({
-        session_id: (input && input.sessionID) || message.sessionID || null,
+        session_id: sessionID,
         cwd: directory || null,
         project: (project && project.id) || basename(worktree) || null,
         model,
@@ -161,6 +201,8 @@ export const AgentPromptCapture = async ({ project, client, $, directory, worktr
       if (!event || event.type !== "session.idle") return;
       const sessionID = sessionIdOf(event);
       if (!sessionID) return;
+      if (!OPEN_SESSIONS.has(sessionID)) return; // no open turn of ours: nothing to end
+      OPEN_SESSIONS.delete(sessionID);
       send({
         event: "turn_end",
         session_id: sessionID,
@@ -223,10 +265,29 @@ def _packaged_plugin() -> Path:
 
 
 def _write_atomic(path: Path, text: str) -> None:
+    """Write via a sibling temp file and one rename, so a reader never sees a half file.
+
+    The temp file is created 0600 and only widened to the mode of the file it replaces
+    (0644 for a new one): a config file must never be briefly world-readable while it
+    is being written, and an existing file's permissions must survive the rename.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o644
     tmp = path.with_name(path.name + ".apc-tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 # --------------------------------------------------------------------------
@@ -234,15 +295,46 @@ def _write_atomic(path: Path, text: str) -> None:
 # --------------------------------------------------------------------------
 
 
+class ConfigFormatError(ValueError):
+    """An existing config file we refuse to touch because we cannot parse it."""
+
+
 def _load_json(path: Path) -> dict[str, Any]:
+    """Parse an existing config file, or fail loudly enough to be actionable.
+
+    We never repair or replace a file we could not read: silently clobbering a user's
+    ``settings.json`` because of a trailing comma is far worse than not installing.
+    A UTF-8 BOM (what Notepad and some editors write) is tolerated; everything else
+    that is not a JSON object is an error naming the file and the reason.
+    """
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8") or "{}")
-    except json.JSONDecodeError:
+        # utf-8-sig strips a leading BOM if present and behaves like utf-8 otherwise.
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        _log.warning("%s could not be read (%s); refusing to overwrite it", path, exc)
+        raise ConfigFormatError(
+            f"{path} could not be read as UTF-8 text ({exc}). "
+            "Fix or move the file, then re-run the install."
+        ) from exc
+    if not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
         _log.warning("%s is not valid JSON; refusing to overwrite it", path)
-        raise
-    return data if isinstance(data, dict) else {}
+        raise ConfigFormatError(
+            f"{path} is not valid JSON ({exc.msg} at line {exc.lineno} column {exc.colno}). "
+            "Refusing to overwrite it - JSON allows no trailing commas or comments. "
+            "Fix the file (or move it aside), then re-run the install."
+        ) from exc
+    if not isinstance(data, dict):
+        raise ConfigFormatError(
+            f"{path} holds a JSON {type(data).__name__}, not an object. "
+            "Refusing to overwrite it; fix the file, then re-run the install."
+        )
+    return data
 
 
 def _has_command(matchers: list[Any], command: str) -> bool:

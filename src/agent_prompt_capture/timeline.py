@@ -7,6 +7,7 @@ prompt timestamps and their ``turn_end_ts``.
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
@@ -27,6 +28,8 @@ __all__ = [
     "activity_timeline",
     "daily_digest",
     "top_terms",
+    "to_local",
+    "from_local",
     "TIME_GROUP_BY",
     "BUCKETS",
     "STOPWORDS",
@@ -34,6 +37,10 @@ __all__ = [
 
 TIME_GROUP_BY = ("project", "source", "day", "hour_of_day", "weekday", "session")
 BUCKETS = ("hour", "day")
+
+#: Hard caps so a wide `since` can never turn into an unbounded loop.
+MAX_TIMELINE_BUCKETS = 5000
+MAX_SLICE_STEPS = 10_000
 
 NO_PROJECT = "(none)"
 
@@ -103,7 +110,19 @@ def _event_start(rec: PromptRecord) -> datetime | None:
 
 
 def _event_end(rec: PromptRecord) -> datetime | None:
-    return parse_dt(rec.turn_end_ts) or parse_dt(rec.ts)
+    """When this prompt's work stopped.
+
+    Never earlier than ``ts``: a ``turn_end_ts`` behind the prompt's own timestamp is
+    clock skew between the hook process and whoever wrote the prompt, and letting it
+    through produces negative spans downstream.
+    """
+    start = parse_dt(rec.ts)
+    end = parse_dt(rec.turn_end_ts)
+    if end is None:
+        return start
+    if start is None:
+        return end
+    return max(start, end)
 
 
 def agent_seconds(rec: PromptRecord) -> float | None:
@@ -223,8 +242,36 @@ def count_context_switches(sessions: Sequence[ActivitySession]) -> int:
 # --------------------------------------------------------------------------
 
 
-def _local_tz():
-    return datetime.now().astimezone().tzinfo or UTC
+def to_local(moment: datetime) -> datetime:
+    """An aware instant as *naive local wall-clock time*.
+
+    ``datetime.now().astimezone().tzinfo`` is a fixed offset frozen at "now", so using
+    it to label a timestamp from the other side of a DST transition is wrong by an
+    hour. ``fromtimestamp`` asks the platform for the offset *at that instant*, which
+    is what "which local hour was this" actually means.
+    """
+    return datetime.fromtimestamp(moment.timestamp())  # noqa: DTZ006 - naive by design
+
+
+def from_local(naive: datetime) -> datetime:
+    """Naive local wall-clock time back to an aware UTC instant, DST included."""
+    if naive.tzinfo is not None:  # pragma: no cover - defensive
+        return naive.astimezone(UTC)
+    return naive.astimezone(UTC)
+
+
+def _advance_local(cursor: datetime, step: timedelta) -> tuple[datetime, datetime]:
+    """``(next_local, next_utc)``, guaranteeing forward progress across DST.
+
+    Adding an hour of wall-clock time lands on the same instant twice during a
+    fall-back transition, so fall back to stepping in UTC when that happens.
+    """
+    current_utc = from_local(cursor)
+    candidate = cursor + step
+    if from_local(candidate) > current_utc:
+        return candidate, from_local(candidate)
+    forced = current_utc + step
+    return to_local(forced), forced
 
 
 def _overlap_minutes(a: tuple[datetime, datetime], b: tuple[datetime, datetime]) -> float:
@@ -322,7 +369,6 @@ def time_summary(
                 }
             )
     else:
-        tz = _local_tz()
         labellers = {
             "day": lambda dt: dt.strftime("%Y-%m-%d"),
             "hour_of_day": lambda dt: f"{dt.hour:02d}",
@@ -332,13 +378,13 @@ def time_summary(
         minutes: dict[str, float] = {}
         bags: dict[str, list[PromptRecord]] = {}
         for session in global_sessions:
-            for slice_start, slice_minutes in _slice_by_label(session, tz, label):
+            for slice_start, slice_minutes in _slice_by_label(session, label):
                 minutes[slice_start] = minutes.get(slice_start, 0.0) + slice_minutes
         for rec in records:
             moment = parse_dt(rec.ts)
             if moment is None:
                 continue
-            name = label(moment.astimezone(tz))
+            name = label(to_local(moment))
             bags.setdefault(name, []).append(rec)
             minutes.setdefault(name, 0.0)
         for name in sorted(minutes):
@@ -365,23 +411,29 @@ def time_summary(
     }
 
 
-def _slice_by_label(session: ActivitySession, tz, label) -> list[tuple[str, float]]:
-    """Split a session's credited interval into per-label minute slices."""
+def _slice_by_label(session: ActivitySession, label) -> list[tuple[str, float]]:
+    """Split a session's credited interval into per-label minute slices.
+
+    Walks *local* hour boundaries so a session that straddles midnight, a DST change
+    or an hour boundary is credited to each label in the right proportion.
+    """
     start, end = session.interval
     if end <= start:
-        return [(label(start.astimezone(tz)), session.active_minutes)]
-    out: list[tuple[str, float]] = []
-    cursor = start
-    while cursor < end:
-        local = cursor.astimezone(tz)
-        hour_start = local.replace(minute=0, second=0, microsecond=0)
-        boundary = (hour_start + timedelta(hours=1)).astimezone(UTC)
-        step_end = min(boundary, end)
-        out.append((label(local), (step_end - cursor).total_seconds() / 60.0))
-        cursor = step_end
+        return [(label(to_local(start)), session.active_minutes)]
     merged: dict[str, float] = {}
-    for name, value in out:
-        merged[name] = merged.get(name, 0.0) + value
+    cursor = start
+    guard = 0
+    while cursor < end and guard < MAX_SLICE_STEPS:
+        guard += 1
+        local = to_local(cursor)
+        hour_start = local.replace(minute=0, second=0, microsecond=0)
+        _, boundary = _advance_local(hour_start, timedelta(hours=1))
+        if boundary <= cursor:  # pragma: no cover - defensive against odd zones
+            boundary = cursor + timedelta(hours=1)
+        step_end = min(boundary, end)
+        name = label(local)
+        merged[name] = merged.get(name, 0.0) + (step_end - cursor).total_seconds() / 60.0
+        cursor = step_end
     return list(merged.items())
 
 
@@ -406,42 +458,78 @@ def activity_timeline(
         records, idle_gap_minutes=cfg.idle_gap_minutes, tail_minutes=cfg.tail_minutes
     )
 
-    tz = _local_tz()
     start_dt = parse_dt(low) or datetime.now(UTC) - timedelta(days=1)
     end_dt = parse_dt(high) or datetime.now(UTC)
     step = timedelta(hours=1) if unit == "hour" else timedelta(days=1)
 
-    local_start = start_dt.astimezone(tz)
+    local_start = to_local(start_dt)
     if unit == "hour":
         local_start = local_start.replace(minute=0, second=0, microsecond=0)
     else:
         local_start = local_start.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    buckets: list[dict[str, Any]] = []
+    # Lay the (contiguous) bucket edges out first, then fill them with one pass over
+    # the records and one pass over the sessions. Scanning every record per bucket is
+    # O(rows x buckets) and falls over on a year of `bucket="day"` at 50k rows.
+    edges: list[datetime] = [from_local(local_start)]
+    locals_: list[datetime] = [local_start]
     cursor = local_start
-    guard = 0
-    while cursor.astimezone(UTC) < end_dt and guard < 5000:
-        guard += 1
-        window = (cursor.astimezone(UTC), (cursor + step).astimezone(UTC))
-        in_window = [
-            r
-            for r in records
-            if (moment := parse_dt(r.ts)) is not None and window[0] <= moment < window[1]
-        ]
-        minutes = sum(_overlap_minutes(s.interval, window) for s in sessions)
-        buckets.append(
-            {
-                "start": to_iso(window[0]),
-                "local_start": cursor.isoformat(),
-                "prompt_count": len(in_window),
-                "active_minutes": round(minutes, 2),
-                "projects": sorted({r.project for r in in_window if r.project}),
-                "sources": sorted({r.source.value for r in in_window}),
-            }
-        )
-        cursor = cursor + step
+    truncated = False
+    while edges[-1] < end_dt:
+        if len(edges) > MAX_TIMELINE_BUCKETS:
+            truncated = True
+            break
+        cursor, boundary = _advance_local(cursor, step)
+        edges.append(boundary)
+        locals_.append(cursor)
 
-    return {"since": low, "until": high, "bucket": unit, "buckets": buckets}
+    count = max(len(edges) - 1, 0)
+    buckets: list[dict[str, Any]] = [
+        {
+            "start": to_iso(edges[i]),
+            "local_start": locals_[i].isoformat(),
+            "prompt_count": 0,
+            "active_minutes": 0.0,
+            "projects": set(),
+            "sources": set(),
+        }
+        for i in range(count)
+    ]
+    if not buckets:
+        return {"since": low, "until": high, "bucket": unit, "buckets": []}
+
+    starts = edges[:count]
+    for rec in records:
+        moment = parse_dt(rec.ts)
+        if moment is None:
+            continue
+        index = bisect_right(starts, moment) - 1
+        if index < 0 or moment >= edges[index + 1]:
+            continue
+        slot = buckets[index]
+        slot["prompt_count"] += 1
+        if rec.project:
+            slot["projects"].add(rec.project)
+        slot["sources"].add(rec.source.value)
+
+    for session in sessions:
+        window = session.interval
+        index = max(bisect_right(starts, window[0]) - 1, 0)
+        while index < count and starts[index] < window[1]:
+            minutes = _overlap_minutes(window, (edges[index], edges[index + 1]))
+            if minutes:
+                buckets[index]["active_minutes"] += minutes
+            index += 1
+
+    for slot in buckets:
+        slot["active_minutes"] = round(slot["active_minutes"], 2)
+        slot["projects"] = sorted(slot["projects"])
+        slot["sources"] = sorted(slot["sources"])
+
+    result: dict[str, Any] = {"since": low, "until": high, "bucket": unit, "buckets": buckets}
+    if truncated:
+        result["truncated"] = True
+    return result
 
 
 def top_terms(records: Iterable[PromptRecord], *, limit: int = 15) -> list[dict[str, Any]]:
@@ -463,19 +551,21 @@ def daily_digest(
 ) -> dict[str, Any]:
     """Everything worth knowing about one local calendar day."""
     cfg = config or Config()
-    tz = _local_tz()
     if date:
         try:
             day = date_cls.fromisoformat(str(date))
         except ValueError as exc:
             raise ValueError(f"date must be YYYY-MM-DD, got {date!r}") from exc
     else:
-        day = datetime.now(tz).date()
+        day = to_local(datetime.now(UTC)).date()
 
-    start_local = datetime(day.year, day.month, day.day, tzinfo=tz)
+    # Local midnight to local midnight, resolved through the platform's DST rules so a
+    # 23- or 25-hour day is still exactly one day. ``until`` is inclusive in the store,
+    # so stop one millisecond short of the next midnight instead of counting it twice.
+    start_local = datetime(day.year, day.month, day.day)  # noqa: DTZ001 - naive local
     end_local = start_local + timedelta(days=1)
-    low = to_iso(start_local.astimezone(UTC))
-    high = to_iso(end_local.astimezone(UTC))
+    low = to_iso(from_local(start_local))
+    high = to_iso(from_local(end_local) - timedelta(milliseconds=1))
 
     records = _fetch(store, low, high)
     sessions = build_activity_sessions(

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -16,17 +17,65 @@ from .ingest import IngestResult, ingest
 from .models import BROWSER_SOURCES, Source
 from .store import Store
 
-__all__ = ["make_server", "serve", "MAX_BODY_BYTES", "ALLOWED_ORIGIN_PREFIXES"]
+__all__ = [
+    "make_server",
+    "serve",
+    "MAX_BODY_BYTES",
+    "ALLOWED_ORIGIN_PREFIXES",
+    "LOOPBACK_HOSTNAMES",
+    "host_allowed",
+]
 
 MAX_BODY_BYTES = 1024 * 1024  # 1 MiB
 DRAIN_LIMIT_BYTES = 16 * 1024 * 1024  # how much of an oversized body we will discard
 ALLOWED_ORIGIN_PREFIXES = ("chrome-extension://", "moz-extension://")
 
+#: The only names a request may address us by. Anything else is a DNS-rebinding
+#: attempt: a page on ``http://evil.example`` whose name resolves to 127.0.0.1 can
+#: reach this socket, but its requests carry ``Host: evil.example``.
+LOOPBACK_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+#: ``127.x.y.z`` and nothing else. A prefix test would happily accept the attacker-owned
+#: name ``127.0.0.1.evil.com``, which is exactly the rebinding case we are blocking.
+_LOOPBACK_V4_RE = re.compile(r"^127(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$")
+
 _log = get_logger()
 
 
 def _is_loopback(host: str) -> bool:
-    return host in {"127.0.0.1", "::1", "localhost"} or host.startswith("127.")
+    return host in {"127.0.0.1", "::1", "localhost"} or bool(_LOOPBACK_V4_RE.match(host))
+
+
+def _split_host_header(value: str) -> str:
+    """The host part of a ``Host:`` header, lower-cased, port and brackets kept apart."""
+    host = value.strip().lower()
+    if host.startswith("["):  # [::1] or [::1]:47821
+        end = host.find("]")
+        if end == -1:
+            return host
+        return host[: end + 1]
+    return host.split(":", 1)[0]
+
+
+def host_allowed(header: str | None, *, extra: str | None = None) -> bool:
+    """Is this ``Host`` header one of our own names?
+
+    ``extra`` is the address the server was told to bind, so ``--allow-remote`` on a
+    LAN address still works. An absent or empty ``Host`` is rejected: HTTP/1.1
+    requires it and every real client sends it.
+    """
+    if not header:
+        return False
+    host = _split_host_header(header)
+    if not host:
+        return False
+    if host in LOOPBACK_HOSTNAMES or _LOOPBACK_V4_RE.match(host):
+        return True
+    if extra:
+        allowed = _split_host_header(str(extra))
+        if allowed and host == allowed:
+            return True
+    return False
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -36,10 +85,14 @@ class _Handler(BaseHTTPRequestHandler):
     # injected by make_server
     config: Config
     store: Store
+    bound_host: str | None = None
 
     # -- plumbing ------------------------------------------------------
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         _log.debug("http %s - %s", self.address_string(), fmt % args)
+
+    def _host_ok(self) -> bool:
+        return host_allowed(self.headers.get("Host"), extra=self.bound_host)
 
     def _origin_allowed(self) -> str | None:
         origin = self.headers.get("Origin")
@@ -73,12 +126,18 @@ class _Handler(BaseHTTPRequestHandler):
         self._respond(status, {"error": message})
 
     def _authorised(self) -> bool:
-        presented = self.headers.get("X-APC-Token") or ""
+        presented = (self.headers.get("X-APC-Token") or "").strip()
         try:
-            expected = self.config.get_token()
-        except OSError:  # pragma: no cover - unwritable home
+            expected = (self.config.get_token() or "").strip()
+        except OSError:  # unreadable/unwritable $APC_HOME: answer 401, never crash
+            _log.warning("could not read the listener token; rejecting the request")
             return False
-        return hmac.compare_digest(presented.strip(), expected.strip())
+        if not expected:  # pragma: no cover - defensive: an empty token authorises nobody
+            return False
+        # Header values arrive as latin-1 str, so a non-ASCII token would make
+        # ``compare_digest`` raise on str inputs. Compare bytes instead: same
+        # constant-time comparison, no TypeError.
+        return hmac.compare_digest(presented.encode("utf-8"), expected.encode("utf-8"))
 
     def _read_body(self) -> bytes | None:
         try:
@@ -108,12 +167,18 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- routes --------------------------------------------------------
     def do_OPTIONS(self) -> None:  # noqa: N802
+        if not self._host_ok():
+            self._error(403, "bad Host header")
+            return
         self.send_response(204)
         self._cors()
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
+        if not self._host_ok():
+            self._error(403, "bad Host header")
+            return
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path == "/v1/health":
             self._respond(200, {"ok": True, "version": __version__})
@@ -133,6 +198,10 @@ class _Handler(BaseHTTPRequestHandler):
         self._error(404, "not found")
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._host_ok():
+            # DNS rebinding: the socket is reachable, the name is not ours.
+            self._error(403, "bad Host header")
+            return
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path != "/v1/prompts":
             self._error(404, "not found")
@@ -206,7 +275,11 @@ def make_server(
             f"refusing to bind non-loopback address {bind_host!r}; pass --allow-remote to override"
         )
 
-    handler = type("_BoundHandler", (_Handler,), {"config": config, "store": store})
+    handler = type(
+        "_BoundHandler",
+        (_Handler,),
+        {"config": config, "store": store, "bound_host": bind_host},
+    )
     server = ThreadingHTTPServer((bind_host, bind_port), handler)
     server.daemon_threads = True
     return server

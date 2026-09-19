@@ -429,3 +429,171 @@ def test_version(capsys):
     with pytest.raises(SystemExit):
         main(["--version"])
     assert "apc" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# regressions: `apc capture` hard rules
+# ---------------------------------------------------------------------------
+
+BAD_PAYLOADS = [
+    "",
+    "   \n  ",
+    "not json at all",
+    "[1, 2, 3]",
+    '"just a string"',
+    "null",
+    "{}",
+    '{"hook_event_name": "PreToolUse"}',
+    '{"hook_event_name": "UserPromptSubmit"}',
+    '{"hook_event_name": "UserPromptSubmit", "prompt": null}',
+    '{"hook_event_name": "UserPromptSubmit", "prompt": 42}',
+    '{"hook_event_name": "UserPromptSubmit", "prompt": "   "}',
+    '{"prompt": "x", "cwd": 1234}',
+    '{"hook_event_name": "UserPromptSubmit", "prompt": "hi", "session_id": {"a": 1}}',
+]
+
+
+@pytest.mark.parametrize("payload", BAD_PAYLOADS, ids=range(len(BAD_PAYLOADS)))
+@pytest.mark.parametrize("target", ["claude-code", "codex", "opencode"])
+def test_capture_is_silent_and_exits_zero_on_anything(apc_home, stdin, capsys, target, payload):
+    """Exit 2 erases the user's prompt; stdout is injected into their context."""
+    stdin(payload)
+    assert main(["capture", target]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "", f"{target}/{payload!r} wrote to stdout"
+    assert captured.err == "", f"{target}/{payload!r} wrote to stderr"
+
+
+def test_capture_survives_a_closed_stdin(apc_home, monkeypatch, capsys):
+    """Codex's legacy notify runs the program with stdin closed."""
+
+    class Closed(io.StringIO):
+        def read(self, *_args):
+            raise ValueError("I/O operation on closed file")
+
+    monkeypatch.setattr("sys.stdin", Closed())
+    assert main(["capture", "codex"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_capture_survives_an_unwritable_apc_home(monkeypatch, stdin, capsys):
+    """A read-only home breaks logging AND the database; the hook still exits 0.
+
+    ``ensure_home`` is patched rather than relying on file modes, because the test
+    may run as a user (root, CI images) for whom chmod means nothing.
+    """
+    import agent_prompt_capture.config as config_mod
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError("read-only home")
+
+    monkeypatch.setattr(config_mod, "ensure_home", denied)
+    monkeypatch.setattr(config_mod, "_LOGGING_CONFIGURED", False, raising=False)
+    stdin(json.dumps(CLAUDE))
+    assert main(["capture", "claude-code"]) == 0
+    assert capsys.readouterr() == ("", "")
+
+
+def test_setup_logging_never_raises_on_an_unwritable_home(monkeypatch):
+    import logging
+
+    import agent_prompt_capture.config as config_mod
+
+    def denied(*_args, **_kwargs):
+        raise PermissionError("read-only home")
+
+    monkeypatch.setattr(config_mod, "ensure_home", denied)
+    logger = config_mod.setup_logging(force=True)
+    assert isinstance(logger, logging.Logger)
+    assert any(isinstance(h, logging.NullHandler) for h in logger.handlers)
+    logger.info("this must not raise")
+
+
+def test_capture_survives_a_store_that_explodes(apc_home, stdin, capsys, monkeypatch):
+    import agent_prompt_capture.store as store_mod
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("disk on fire")
+
+    monkeypatch.setattr(store_mod.Store, "__init__", boom)
+    stdin(json.dumps(CLAUDE))
+    assert main(["capture", "claude-code"]) == 0
+    assert capsys.readouterr() == ("", "")
+
+
+def test_capture_from_argv_never_touches_stdin(apc_home, monkeypatch, capsys):
+    """The notify program passes JSON as the final argv argument, stdin closed."""
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("stdin must not be read when argv carries the payload")
+
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    monkeypatch.setattr("sys.stdin.read", explode)
+    assert main(["capture", "codex", json.dumps(CODEX_NOTIFY)]) == 0
+    assert capsys.readouterr() == ("", "")
+    store = db(apc_home)
+    try:
+        records = store.list()
+        assert len(records) == 1
+        assert records[0].prompt == "ship the release"
+        assert records[0].metadata["turn_id"] == "12345"
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    "argument", ["", "   ", "not json", "[1,2]", "{oops", '"string"', "{}extra"]
+)
+def test_capture_falls_back_to_stdin_for_a_non_object_argv(apc_home, stdin, argument, capsys):
+    stdin(json.dumps(CLAUDE))
+    assert main(["capture", "claude-code", argument]) == 0
+    assert capsys.readouterr() == ("", "")
+    store = db(apc_home)
+    try:
+        assert store.count() == 1
+    finally:
+        store.close()
+
+
+# ---------------------------------------------------------------------------
+# regressions: export / purge never leak
+# ---------------------------------------------------------------------------
+
+
+def test_export_only_emits_scrubbed_fields(apc_home, stdin, capsys):
+    stdin(json.dumps(CLAUDE))
+    main(["capture", "claude-code"])
+    capsys.readouterr()
+
+    main(["export", "--format", "jsonl"])
+    out = capsys.readouterr().out
+    assert "alice@example.com" not in out
+    assert "/Users/alice" not in out
+    assert "[EMAIL_1]" in out
+    assert "/Users/[USER]/dev/proj" in out
+
+    main(["export", "--format", "csv"])
+    csv_out = capsys.readouterr().out
+    assert "alice@example.com" not in csv_out
+    assert "/Users/alice" not in csv_out
+
+
+def test_export_carries_no_local_paths_of_its_own(apc_home, stdin, capsys):
+    """Nothing from the runtime config (APC_HOME, db path) belongs in an export."""
+    stdin(json.dumps(CLAUDE))
+    main(["capture", "claude-code"])
+    capsys.readouterr()
+    main(["export", "--format", "jsonl"])
+    out = capsys.readouterr().out
+    assert str(apc_home) not in out
+    assert "prompts.db" not in out
+
+
+def test_purge_reports_only_a_count(apc_home, stdin, capsys):
+    stdin(json.dumps(CLAUDE))
+    main(["capture", "claude-code"])
+    capsys.readouterr()
+    assert main(["purge", "--source", "claude_code", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert out.strip() == "deleted 1 prompt(s)"
+    assert "alice" not in out

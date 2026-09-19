@@ -32,6 +32,14 @@ def parse(payload: Any) -> Adapted:
         value = coerce_str(data.get(key))
         if value:
             metadata[key] = value
+    # The plugin sends these (hook-specs.md §5): messageID is the dedupe key, and the
+    # attachment count is the only trace of an image-only or file-carrying turn.
+    message_id = coerce_str(data.get("messageID")) or coerce_str(data.get("message_id"))
+    if message_id:
+        metadata["messageID"] = message_id
+    attachments = _attachment_count(data.get("attachments"))
+    if attachments is not None:
+        metadata["attachments"] = attachments
 
     return RawPrompt(
         prompt=prompt,
@@ -41,6 +49,19 @@ def parse(payload: Any) -> Adapted:
         metadata=metadata,
         ts=coerce_str(data.get("ts")),
     )
+
+
+def _attachment_count(value: Any) -> int | None:
+    """``metadata.attachments`` is a count, and stays an ``int``."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
 
 
 def _project(cwd: str | None) -> str | None:
