@@ -5,6 +5,8 @@
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now apc-listener
 # Replace %h/.local/bin/apc with the output of `which apc` if it differs.
+# See the "Browser capture" section of README.md for the rest of the setup
+# (`apc token`, the extension Options, and the two allowlists).
 [Unit]
 Description=Agent Prompt Capture local HTTP listener (127.0.0.1 only)
 After=default.target

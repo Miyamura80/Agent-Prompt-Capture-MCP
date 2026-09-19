@@ -3,7 +3,10 @@
      Install:
        cp docs/service/com.agent-prompt-capture.listener.plist ~/Library/LaunchAgents/
        launchctl load -w ~/Library/LaunchAgents/com.agent-prompt-capture.listener.plist
-     Replace /usr/local/bin/apc with the output of `which apc` (or use `uvx`). -->
+     Replace /usr/local/bin/apc with the output of `which apc`, or use
+     `uvx --from /path/to/Agent-Prompt-Capture-MCP apc serve`.
+     See the "Browser capture" section of README.md for the rest of the setup
+     (`apc token`, the extension Options, and the two allowlists). -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
