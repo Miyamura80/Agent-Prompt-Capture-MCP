@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Agent Prompt Capture - Options</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="wrap">
+      <h1>Agent Prompt Capture</h1>
+      <p class="hint">
+        Prompts you submit on claude.ai and chatgpt.com are sent to your local
+        <code>apc serve</code> listener, which scrubs them before anything is written to disk.
+        Nothing is ever sent anywhere else.
+      </p>
+
+      <h2>Listener</h2>
+      <label class="field">
+        <span class="label">Server URL</span>
+        <input id="serverUrl" type="url" spellcheck="false" placeholder="http://127.0.0.1:47821" />
+        <span class="hint">Default <code>http://127.0.0.1:47821</code>. Must be loopback.</span>
+      </label>
+
+      <label class="field">
+        <span class="label">Token</span>
+        <input id="token" type="password" spellcheck="false" autocomplete="off" placeholder="run: apc token" />
+        <span class="hint">
+          Sent as the <code>X-APC-Token</code> header. Stored in <code>chrome.storage.local</code>,
+          never synced to your Google account.
+        </span>
+      </label>
+
+      <h2>Allowed accounts</h2>
+      <label class="field">
+        <span class="label">One email address per line</span>
+        <textarea id="allowedAccounts" spellcheck="false" placeholder="me@work.com"></textarea>
+        <span class="hint">
+          Browser prompts are captured only for these accounts. An empty list captures nothing.
+          Addresses are lowercased and trimmed on save.
+        </span>
+      </label>
+
+      <h2>Sources</h2>
+      <div class="checks">
+        <label><input type="checkbox" id="src-claude_web" /> claude_web <span class="hint">claude.ai chat</span></label>
+        <label><input type="checkbox" id="src-claude_code_web" /> claude_code_web <span class="hint">claude.ai/code</span></label>
+        <label><input type="checkbox" id="src-chatgpt_web" /> chatgpt_web <span class="hint">chatgpt.com chat</span></label>
+        <label><input type="checkbox" id="src-codex_cloud" /> codex_cloud <span class="hint">chatgpt.com/codex</span></label>
+      </div>
+
+      <div class="row">
+        <button id="save" class="primary" type="button">Save</button>
+        <button id="test" type="button">Test connection</button>
+        <button id="clearQueue" type="button">Clear queue</button>
+      </div>
+      <div id="status" class="status" role="status" aria-live="polite"></div>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>

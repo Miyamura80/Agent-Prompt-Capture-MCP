@@ -1,0 +1,7 @@
+{
+  "name": "agent-prompt-capture-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome MV3 extension for Agent Prompt Capture. No build step; package.json exists only so node tooling treats the .js files as ES modules."
+}
