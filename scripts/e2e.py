@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import urllib.error
 import urllib.request
 from datetime import UTC, datetime, timedelta
@@ -70,6 +71,14 @@ OC_SESSION = "ses_1"
 OC_REAL_TEXT = "refactor the tokenizer and explain the tradeoffs"
 OC_SYNTHETIC_TEXT = "Use the above message and context to generate a prompt and call the task tool"
 SMOKE_PROMPT_HEAD = "summarise the changelog"
+
+#: Codex runs a hook only once its identity hash is trusted in the user layer's
+#: config.toml. Confirmed against the real Codex CLI 0.155.1 on 2026-09-20 for
+#: `apc capture codex` with a timeout of 10.
+CODEX_TRUST_HASHES = {
+    "user_prompt_submit": "sha256:84bac188cd8cd2224b7d68e5b2bd25390fa243baea19406b97983e6cb3ef61bc",
+    "stop": "sha256:d955e4abf3ea73d405f18346ddf4eb848ed4b574ac58c6635614ba260151f987",
+}
 
 #: Every raw secret that must never appear in stored data or MCP responses.
 RAW_SECRETS = (SECRET_EMAIL, SECRET_KEY, LISTENER_EMAIL, LISTENER_KEY, "/Users/alice", ACCOUNT)
@@ -263,6 +272,10 @@ class Env:
         return self.codex_home / "hooks.json"
 
     @property
+    def codex_config_toml(self) -> Path:
+        return self.codex_home / "config.toml"
+
+    @property
     def opencode_plugin(self) -> Path:
         return self.xdg_config / "opencode" / "plugin" / "agent-prompt-capture.js"
 
@@ -346,6 +359,7 @@ def step_install(env: Env) -> None:
         "opencode": env.opencode_plugin,
     }
 
+    trust_digests: list[str] = []
     for target in targets:
         outputs[target] = []
         digests[target] = []
@@ -357,6 +371,9 @@ def step_install(env: Env) -> None:
             outputs[target].append(proc.stdout)
             path = watched[target]
             digests[target].append(path.read_bytes().hex() if path.exists() else "<missing>")
+            if target == "codex":
+                config = env.codex_config_toml
+                trust_digests.append(config.read_bytes().hex() if config.exists() else "<missing>")
         R.check(f"apc install {target} exits 0", True)
 
     # -- the hook config that landed on disk
@@ -379,6 +396,25 @@ def step_install(env: Env) -> None:
             "apc capture codex" in rendered,
             rendered[:200],
         )
+
+    # -- hook trust: discovered is not the same as trusted, and untrusted never runs
+    try:
+        codex_config = tomllib.loads(env.codex_config_toml.read_text(encoding="utf-8"))
+        parsed = True
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        codex_config, parsed = {}, False
+        R.check("~/.codex/config.toml parses as TOML", False, str(exc))
+    if parsed:
+        R.check("~/.codex/config.toml parses as TOML", True)
+        state = codex_config.get("hooks", {}).get("state", {})
+        for label, digest in CODEX_TRUST_HASHES.items():
+            key = f"{env.codex_hooks_json}:{label}:0:0"
+            entry = state.get(key)
+            R.check(
+                f"[hooks.state] trusts the {label} hook with the pinned hash",
+                isinstance(entry, dict) and entry.get("trusted_hash") == digest,
+                f"{key} -> {json.dumps(entry)}",
+            )
 
     R.check(
         "OpenCode plugin installed in ~/.config/opencode/plugin/",
@@ -411,9 +447,15 @@ def step_install(env: Env) -> None:
                 "this is a reporting difference, not a non-idempotent write"
             )
 
+    R.check(
+        "apc install codex is idempotent on ~/.codex/config.toml (runs 1/2/3 byte-identical)",
+        len(set(trust_digests)) == 1,
+        f"digests differ across runs for {env.codex_config_toml}",
+    )
+
     doctor = apc(env, "doctor")
     R.check("apc doctor exits 0", doctor.returncode == 0, doctor.stderr.strip())
-    for needle in ("claude-code hooks", "codex hooks", "opencode plugin"):
+    for needle in ("claude-code hooks", "codex hooks", "codex hooks trusted", "opencode plugin"):
         R.check(
             f"apc doctor reports {needle} as [ok]",
             any(

@@ -61,6 +61,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="codex only: use the deprecated notify program instead of hooks.json",
     )
+    install.add_argument(
+        "--no-trust",
+        action="store_true",
+        help=(
+            "codex only: do not write the hook trust entries into config.toml. "
+            'Codex then ignores the hooks until you start `codex` and choose "Trust all '
+            'and continue".'
+        ),
+    )
 
     uninstall = sub.add_parser("uninstall", help="remove the hook config for an agent")
     uninstall.add_argument("target", choices=_INSTALL_TARGETS)
@@ -266,7 +275,7 @@ def cmd_mcp(_args: argparse.Namespace) -> int:
 def cmd_install(args: argparse.Namespace) -> int:
     from .installer import install  # noqa: PLC0415
 
-    print(install(args.target, dry_run=args.dry_run, legacy=args.legacy))
+    print(install(args.target, dry_run=args.dry_run, legacy=args.legacy, trust=not args.no_trust))
     return 0
 
 
@@ -552,8 +561,14 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     codex_hooks = _codex_hooks_installed(hooks_json)
     checks.append((codex_hooks, f"codex hooks in {hooks_json}"))
     codex_toml = codex_config_path()
+    codex_trusted = _codex_hooks_trusted(codex_toml)
+    if codex_hooks and codex_trusted:
+        checks.append((True, f"codex hooks trusted in {codex_toml}"))
     codex_notify = _codex_notify_installed(codex_toml)
-    checks.append((codex_hooks or codex_notify, f"codex notify (legacy) in {codex_toml}"))
+    if codex_notify:
+        checks.append((True, f"codex notify (legacy) in {codex_toml}"))
+    elif not codex_hooks:
+        checks.append((False, f"codex hooks or notify in {codex_toml}"))
     plugin = opencode_plugin_path()
     checks.append((plugin.exists(), f"opencode plugin {plugin}"))
 
@@ -561,6 +576,11 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
         print(f"  {'[ok]  ' if ok else '[--]  '}{label}")
 
     warnings: list[str] = []
+    if codex_hooks and not codex_trusted:
+        warnings.append(
+            "codex hooks installed but NOT trusted: run 'apc install codex' again, or "
+            "start 'codex' and choose \"Trust all and continue\""
+        )
     if codex_hooks and codex_notify:
         warnings.append(
             "codex is configured twice (hooks.json AND a notify line): every turn will be "
@@ -616,6 +636,35 @@ def _codex_hooks_installed(path: Path) -> bool:
         return False
     hooks = data.get("hooks") if isinstance(data, dict) else None
     return isinstance(hooks, dict) and CODEX_HOOK_COMMAND in json.dumps(hooks)
+
+
+def _codex_hooks_trusted(config_path: Path) -> bool:
+    """Does ``config.toml`` hold a matching ``trusted_hash`` for every hook we installed?
+
+    The keys are derived from the hooks.json that is on disk right now, so a moved
+    ``CODEX_HOME`` (keys pointing at the old path) reads as untrusted, which is exactly
+    what Codex itself would conclude.
+    """
+    import tomllib  # noqa: PLC0415
+
+    from .installer import codex_expected_trust  # noqa: PLC0415
+
+    expected = codex_expected_trust()
+    if not expected:
+        return False
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return False
+    hooks = data.get("hooks")
+    state = hooks.get("state") if isinstance(hooks, dict) else None
+    if not isinstance(state, dict):
+        return False
+    for key, digest in expected.items():
+        entry = state.get(key)
+        if not isinstance(entry, dict) or entry.get("trusted_hash") != digest:
+            return False
+    return True
 
 
 def _codex_notify_installed(path: Path) -> bool:

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +22,15 @@ __all__ = [
     "CODEX_HOOK_COMMAND",
     "CODEX_HOOK_EVENTS",
     "CLAUDE_HOOK_EVENTS",
+    "HOOK_TIMEOUT",
     "OPENCODE_PLUGIN_NAME",
     "OPENCODE_PLUGIN_SOURCE",
     "claude_settings_path",
     "codex_config_path",
+    "codex_event_label",
+    "codex_expected_trust",
+    "codex_hook_state_key",
+    "codex_hook_trust_hash",
     "codex_hooks_path",
     "opencode_plugin_path",
 ]
@@ -487,6 +494,317 @@ def _install_codex_hooks(*, dry_run: bool) -> str:
     return f"installed codex hooks ({', '.join(added)}) in {path}"
 
 
+# -- hook trust -------------------------------------------------------------
+#
+# Codex DISCOVERS hooks.json but refuses to RUN anything in it until the hook's
+# identity hash has been trusted in the user layer's config.toml, under
+# ``[hooks.state]``, keyed by
+# ``"<absolute path of hooks.json>:<event_label>:<group_index>:<handler_index>"``.
+# Verified live against Codex CLI 0.155.1 on 2026-09-20; see
+# docs/research/hook-specs.md section 2.
+
+
+def codex_event_label(event: str) -> str:
+    """``UserPromptSubmit`` -> ``user_prompt_submit``: the label Codex keys trust on."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", event).lower()
+
+
+def codex_hook_trust_hash(event_label: str, command: str, timeout: int) -> str:
+    """``"sha256:" + sha256(canonical_json)`` over the hook's normalized identity.
+
+    Canonical JSON is compact and recursively key-sorted. Optional fields Codex
+    leaves unset (``matcher`` above all) are omitted, not sent as null.
+    """
+    identity = {
+        "event_name": event_label,
+        "hooks": [{"async": False, "command": command, "timeout": int(timeout), "type": "command"}],
+    }
+    canonical = json.dumps(identity, separators=(",", ":"), sort_keys=True)
+    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def codex_hook_state_key(
+    hooks_json_path: Path | str,
+    event_label: str,
+    group: int = 0,
+    handler: int = 0,
+) -> str:
+    """The ``[hooks.state]`` key Codex looks the trusted hash up under."""
+    absolute = os.path.abspath(os.path.expanduser(str(hooks_json_path)))
+    return f"{absolute}:{event_label}:{int(group)}:{int(handler)}"
+
+
+def codex_expected_trust(hooks_path: Path | None = None) -> dict[str, str]:
+    """``state key -> trusted hash`` for every apc hook actually in ``hooks.json``.
+
+    The key carries the group and handler index, so it is read back off the file we
+    just wrote rather than assumed to be ``0:0``: our group lands after whatever
+    hooks were already registered for that event.
+    """
+    path = hooks_path or codex_hooks_path()
+    try:
+        document = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return {}
+    hooks = document.get("hooks") if isinstance(document, dict) else None
+    if not isinstance(hooks, dict):
+        return {}
+
+    entries: dict[str, str] = {}
+    for event in CODEX_HOOK_EVENTS:
+        groups = hooks.get(event)
+        if not isinstance(groups, list):
+            continue
+        label = codex_event_label(event)
+        for group_index, group in enumerate(groups):
+            handlers = group.get("hooks") if isinstance(group, dict) else None
+            if not isinstance(handlers, list):
+                continue
+            for handler_index, handler in enumerate(handlers):
+                if not isinstance(handler, dict):
+                    continue
+                if str(handler.get("command", "")) != CODEX_HOOK_COMMAND:
+                    continue
+                timeout = handler.get("timeout")
+                entries[codex_hook_state_key(path, label, group_index, handler_index)] = (
+                    codex_hook_trust_hash(
+                        label,
+                        CODEX_HOOK_COMMAND,
+                        HOOK_TIMEOUT if timeout is None else int(timeout),
+                    )
+                )
+    return entries
+
+
+_TOML_HEADER = re.compile(r"^[ \t]*\[\[?[^\]\n]*\]\]?[ \t]*(?:#[^\n]*)?$", re.MULTILINE)
+_TRUSTED_HASH = re.compile(r'(trusted_hash[ \t]*=[ \t]*)"(?:[^"\\]|\\.)*"')
+
+
+def _toml_tables(text: str) -> list[tuple[str, int, int, int]]:
+    """``(header, header start, body start, body end)`` for every table in ``text``."""
+    tables: list[tuple[str, int, int, int]] = []
+    headers = list(_TOML_HEADER.finditer(text))
+    for index, header in enumerate(headers):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        tables.append((header.group(0).strip(), header.start(), header.end(), end))
+    return tables
+
+
+def _toml_key(key: str) -> str:
+    """``key`` as a TOML basic string. JSON and TOML agree on the escapes we can hit."""
+    return json.dumps(key)
+
+
+def _state_table_body(text: str) -> tuple[int, int] | None:
+    for header, _start, body_start, body_end in _toml_tables(text):
+        if re.fullmatch(r"\[[ \t]*hooks[ \t]*\.[ \t]*state[ \t]*\]", header):
+            return body_start, body_end
+    return None
+
+
+def _state_entry_table(text: str, key: str) -> tuple[int, int, int] | None:
+    """``(header start, body start, body end)`` of a ``[hooks.state."<key>"]`` block."""
+    quoted = re.escape(_toml_key(key))
+    pattern = re.compile(r"\[[ \t]*hooks[ \t]*\.[ \t]*state[ \t]*\.[ \t]*" + quoted + r"[ \t]*\]")
+    for header, start, body_start, body_end in _toml_tables(text):
+        if pattern.fullmatch(header):
+            return start, body_start, body_end
+    return None
+
+
+def _set_trust_entry(text: str, key: str, digest: str) -> str:
+    """Set ``trusted_hash`` for ``key``, updating an existing entry in place if there is one.
+
+    Three shapes are handled: the ``[hooks.state."<key>"]`` table header we write, an
+    inline ``"<key>" = { trusted_hash = "..." }`` inside ``[hooks.state]``, and no
+    entry at all. Appending always uses the self-contained header form, which cannot
+    land inside whatever table happens to be last in the file.
+    """
+    rendered = f'trusted_hash = "{digest}"'
+
+    span = _state_entry_table(text, key)
+    if span is not None:
+        _, body_start, body_end = span
+        body = text[body_start:body_end]
+        if _TRUSTED_HASH.search(body):
+            patched = _TRUSTED_HASH.sub(lambda m: m.group(1) + f'"{digest}"', body, count=1)
+        else:
+            patched = ("\n" if not body.startswith("\n") else "") + rendered + "\n" + body
+        return text[:body_start] + patched + text[body_end:]
+
+    state = _state_table_body(text)
+    if state is not None:
+        body = text[state[0] : state[1]]
+        inline = re.compile(
+            r"^([ \t]*" + re.escape(_toml_key(key)) + r"[ \t]*=[ \t]*\{[^}\n]*?"
+            r"trusted_hash[ \t]*=[ \t]*)\"(?:[^\"\\]|\\.)*\"",
+            re.MULTILINE,
+        )
+        patched, count = inline.subn(lambda m: m.group(1) + f'"{digest}"', body, count=1)
+        if count:
+            return text[: state[0]] + patched + text[state[1] :]
+
+    block = f"[hooks.state.{_toml_key(key)}]\n{rendered}\n"
+    if not text:
+        return block
+    separator = "" if text.endswith("\n\n") else ("\n" if text.endswith("\n") else "\n\n")
+    return text + separator + block
+
+
+def _parse_toml(path: Path, text: str) -> dict[str, Any]:
+    try:
+        return tomllib.loads(text) if text.strip() else {}
+    except tomllib.TOMLDecodeError as exc:
+        _log.warning("%s is not valid TOML; refusing to touch it", path)
+        raise ConfigFormatError(
+            f"{path} is not valid TOML ({exc}). Refusing to touch it. "
+            "Fix the file (or move it aside), then re-run the install."
+        ) from exc
+
+
+def _trust_state(data: dict[str, Any]) -> dict[str, Any]:
+    hooks = data.get("hooks")
+    state = hooks.get("state") if isinstance(hooks, dict) else None
+    return state if isinstance(state, dict) else {}
+
+
+def _stored_hash(state: dict[str, Any], key: str) -> str | None:
+    entry = state.get(key)
+    if isinstance(entry, dict):
+        value = entry.get("trusted_hash")
+        return value if isinstance(value, str) else None
+    return None
+
+
+def _install_codex_trust(entries: dict[str, str], *, dry_run: bool) -> str:
+    """Persist ``entries`` into ``$CODEX_HOME/config.toml`` under ``[hooks.state]``."""
+    path = codex_config_path()
+    if not entries:
+        return f"no codex hooks to trust in {path}"
+
+    existed = path.exists()
+    try:
+        original = path.read_text(encoding="utf-8") if existed else ""
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigFormatError(
+            f"{path} could not be read as UTF-8 text ({exc}). "
+            "Fix or move the file, then re-run the install."
+        ) from exc
+    state = _trust_state(_parse_toml(path, original))
+    pending = {k: v for k, v in entries.items() if _stored_hash(state, k) != v}
+
+    if not pending:
+        return f"codex hooks already trusted in {path} (no changes)"
+    if dry_run:
+        return f"[dry-run] would trust {len(pending)} codex hook(s) in {path}"
+
+    text = original
+    for key, digest in pending.items():
+        text = _set_trust_entry(text, key, digest)
+
+    # Validate before writing: a file we cannot parse back is never worth shipping.
+    # An unusual spelling of an existing entry lands here rather than on disk.
+    try:
+        candidate = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        candidate = {}
+    if not _trust_is_applied(candidate, entries):
+        raise ConfigFormatError(
+            f"refusing to write {path}: the hook trust entries could not be set without "
+            "disturbing the rest of the file. Add them by hand, or start `codex` once and "
+            'choose "Trust all and continue".'
+        )
+
+    _write_atomic(path, text)
+    try:
+        written = tomllib.loads(path.read_text(encoding="utf-8"))
+        applied = _trust_is_applied(written, entries)
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        applied = False
+    if not applied:
+        if existed:
+            _write_atomic(path, original)
+        else:
+            path.unlink(missing_ok=True)
+        raise ConfigFormatError(
+            f"{path} did not parse back after writing the codex hook trust entries; "
+            "the file has been restored unchanged."
+        )
+    return f"trusted codex hooks in {path} ({len(pending)} entries)"
+
+
+def _trust_is_applied(data: dict[str, Any], entries: dict[str, str]) -> bool:
+    state = _trust_state(data)
+    return all(_stored_hash(state, key) == digest for key, digest in entries.items())
+
+
+def _codex_trust_keys(state: dict[str, Any]) -> list[str]:
+    """Every ``[hooks.state]`` key that we wrote: our hooks.json, our labels, our hash."""
+    prefixes = {
+        f"{os.path.abspath(str(codex_hooks_path()))}:{codex_event_label(event)}:": (
+            codex_hook_trust_hash(codex_event_label(event), CODEX_HOOK_COMMAND, HOOK_TIMEOUT)
+        )
+        for event in CODEX_HOOK_EVENTS
+    }
+    ours = codex_expected_trust()
+    keys: list[str] = []
+    for key in state:
+        if not isinstance(key, str):
+            continue
+        stored = _stored_hash(state, key)
+        if ours.get(key) == stored and stored is not None:
+            keys.append(key)
+            continue
+        for prefix, digest in prefixes.items():
+            if key.startswith(prefix) and stored == digest:
+                keys.append(key)
+                break
+    return keys
+
+
+def _drop_trust_entry(text: str, key: str) -> str:
+    span = _state_entry_table(text, key)
+    if span is not None:
+        # The whole `[hooks.state."<key>"]` block, header line included.
+        start, _body_start, body_end = span
+        return text[:start] + text[body_end:]
+    state = _state_table_body(text)
+    if state is not None:
+        body = text[state[0] : state[1]]
+        inline = re.compile(
+            r"^[ \t]*" + re.escape(_toml_key(key)) + r"[ \t]*=[ \t]*\{[^}\n]*\}[ \t]*\n?",
+            re.MULTILINE,
+        )
+        patched, count = inline.subn("", body, count=1)
+        if count:
+            return text[: state[0]] + patched + text[state[1] :]
+    return text
+
+
+def _uninstall_codex_trust() -> str:
+    path = codex_config_path()
+    if not path.exists():
+        return f"no codex hook trust entries in {path}"
+    # A config we cannot read must not stop the rest of the uninstall.
+    try:
+        original = path.read_text(encoding="utf-8")
+        keys = _codex_trust_keys(_trust_state(_parse_toml(path, original)))
+    except (OSError, UnicodeDecodeError, ConfigFormatError) as exc:
+        return f"could not read the codex hook trust entries in {path} ({exc})"
+    if not keys:
+        return f"no codex hook trust entries in {path}"
+
+    text = original
+    for key in keys:
+        text = _drop_trust_entry(text, key)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    remaining = _trust_state(_parse_toml(path, text))
+    if any(key in remaining for key in keys):
+        return f"could not remove the codex hook trust entries from {path}; remove them by hand"
+    _write_atomic(path, text)
+    return f"removed codex hook trust entries ({len(keys)}) from {path}"
+
+
 def _install_codex_notify(*, dry_run: bool) -> str:
     """Legacy path: the deprecated ``notify`` program in ``config.toml``."""
     path = codex_config_path()
@@ -521,15 +839,45 @@ def _install_codex_notify(*, dry_run: bool) -> str:
     return f"installed codex notify (legacy) in {path}"
 
 
-def _install_codex(*, dry_run: bool, legacy: bool = False) -> str:
+#: Printed when the user asked us not to write the trust entries ourselves.
+CODEX_TRUST_ALTERNATIVE = (
+    "not trusting the codex hooks (--no-trust): start `codex` once and choose "
+    '"Trust all and continue", or they will never run.'
+)
+
+
+def _install_codex(*, dry_run: bool, legacy: bool = False, trust: bool = True) -> str:
     if legacy:
         return _install_codex_notify(dry_run=dry_run)
-    return _install_codex_hooks(dry_run=dry_run)
+    message = _install_codex_hooks(dry_run=dry_run)
+    if not trust:
+        return f"{message}\n{CODEX_TRUST_ALTERNATIVE}"
+    entries = (
+        _planned_codex_trust() if dry_run else codex_expected_trust()
+    )  # dry run has nothing on disk to read back
+    return f"{message}\n{_install_codex_trust(entries, dry_run=dry_run)}"
+
+
+def _planned_codex_trust() -> dict[str, str]:
+    """What ``codex_expected_trust`` would return once the hooks are on disk."""
+    entries = codex_expected_trust()
+    path = codex_hooks_path()
+    for event in CODEX_HOOK_EVENTS:
+        label = codex_event_label(event)
+        if any(key.startswith(f"{os.path.abspath(str(path))}:{label}:") for key in entries):
+            continue
+        entries[codex_hook_state_key(path, label)] = codex_hook_trust_hash(
+            label, CODEX_HOOK_COMMAND, HOOK_TIMEOUT
+        )
+    return entries
 
 
 def _uninstall_codex() -> str:
-    """Remove both the hooks.json entries and any apc notify line."""
+    """Remove the hooks.json entries, their trust entries and any apc notify line."""
     messages: list[str] = []
+
+    # Before the hooks go: the trust keys carry the indices they had in hooks.json.
+    trust_message = _uninstall_codex_trust()
 
     hooks_path = codex_hooks_path()
     if hooks_path.exists():
@@ -556,6 +904,8 @@ def _uninstall_codex() -> str:
             messages.append(f"no apc hooks found in {hooks_path}")
     else:
         messages.append(f"nothing to remove: {hooks_path} does not exist")
+
+    messages.append(trust_message)
 
     config = codex_config_path()
     if config.exists():
@@ -605,17 +955,27 @@ def _uninstall_opencode() -> str:
 # --------------------------------------------------------------------------
 
 
-def install(target: str, dry_run: bool = False, *, legacy: bool = False) -> str:
+def install(
+    target: str,
+    dry_run: bool = False,
+    *,
+    legacy: bool = False,
+    trust: bool = True,
+) -> str:
     """Install the hook configuration for ``target``. Idempotent.
 
     ``legacy`` only affects ``codex``: it writes the deprecated ``notify`` line into
     ``config.toml`` instead of merging into Codex's native ``hooks.json``.
+
+    ``trust`` only affects ``codex`` as well: Codex will not run a hook it has not been
+    told to trust, so by default the install also writes the hooks' identity hashes into
+    ``$CODEX_HOME/config.toml``. ``trust=False`` leaves that to the user.
     """
     key = str(target).strip().lower().replace("_", "-")
     if key in ("claude-code", "claudecode"):
         return _install_claude_code(dry_run=dry_run)
     if key in ("codex", "codex-cli"):
-        return _install_codex(dry_run=dry_run, legacy=legacy)
+        return _install_codex(dry_run=dry_run, legacy=legacy, trust=trust)
     if key == "opencode":
         return _install_opencode(dry_run=dry_run)
     raise ValueError(f"unknown install target {target!r}; expected one of {', '.join(TARGETS)}")

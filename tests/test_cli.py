@@ -365,6 +365,8 @@ def test_install_and_uninstall_through_the_cli(apc_home, capsys):
     assert "hooks.json" in capsys.readouterr().out
     assert main(["install", "codex", "--legacy"]) == 0
     assert "notify" in capsys.readouterr().out
+    assert main(["install", "codex", "--no-trust"]) == 0
+    assert "Trust all and continue" in capsys.readouterr().out
     assert main(["uninstall", "codex"]) == 0
     assert "removed" in capsys.readouterr().out
 
@@ -380,6 +382,47 @@ def test_doctor(apc_home, capsys):
     assert "codex hooks" in out
     assert "opencode plugin" in out
     assert "claude.ai/code" in out  # the web-hooks caveat
+
+
+def test_doctor_reports_trusted_codex_hooks(apc_home, capsys):
+    main(["install", "codex"])
+    capsys.readouterr()
+    main(["doctor"])
+    out = capsys.readouterr().out
+    assert any(
+        line.strip().startswith("[ok]") and "codex hooks trusted" in line
+        for line in out.splitlines()
+    ), out
+    assert "NOT trusted" not in out
+
+
+def test_doctor_warns_when_codex_hooks_are_not_trusted(apc_home, capsys):
+    main(["install", "codex", "--no-trust"])
+    out = capsys.readouterr().out
+    assert "Trust all and continue" in out
+    main(["doctor"])
+    out = capsys.readouterr().out
+    assert "[warn] codex hooks installed but NOT trusted" in out
+    assert "apc install codex" in out
+    assert "codex hooks trusted" not in out
+
+
+def test_doctor_warns_when_the_trust_entries_point_at_another_codex_home(
+    apc_home, capsys, monkeypatch, tmp_path
+):
+    """A moved CODEX_HOME leaves the keys naming the old hooks.json: not trusted."""
+    first = tmp_path / "codex-one"
+    monkeypatch.setenv("CODEX_HOME", str(first))
+    main(["install", "codex"])
+    moved = tmp_path / "codex-two"
+    moved.mkdir()
+    (moved / "hooks.json").write_text((first / "hooks.json").read_text())
+    (moved / "config.toml").write_text((first / "config.toml").read_text())
+    monkeypatch.setenv("CODEX_HOME", str(moved))
+    capsys.readouterr()
+    main(["doctor"])
+    out = capsys.readouterr().out
+    assert "[warn] codex hooks installed but NOT trusted" in out
 
 
 def test_doctor_warns_about_double_codex_capture(apc_home, capsys):

@@ -207,8 +207,8 @@ Every subcommand of `apc`. `--since` / `--until` / `--before` take ISO 8601, a b
 | `apc capture <claude-code\|codex\|opencode> [payload]` | | read hook JSON from the trailing argument (Codex `notify`) or stdin, ingest it. Never prints, never raises, always exits 0 |
 | `apc serve` | `--host`, `--port`, `--allow-remote` | run the loopback HTTP listener for the extension. Non-loopback hosts are refused unless `--allow-remote` |
 | `apc mcp` | | run the stdio MCP server |
-| `apc install <claude-code\|codex\|opencode>` | `--dry-run`, `--legacy` | write the hook config, idempotently. `--legacy` is Codex only |
-| `apc uninstall <claude-code\|codex\|opencode>` | | remove what `install` wrote |
+| `apc install <claude-code\|codex\|opencode>` | `--dry-run`, `--legacy`, `--no-trust` | write the hook config, idempotently. `--legacy` and `--no-trust` are Codex only; `--no-trust` skips the `[hooks.state]` trust entries in `config.toml` |
+| `apc uninstall <claude-code\|codex\|opencode>` | | remove what `install` wrote, trust entries included |
 | `apc token` | `--rotate` | print the listener token, or generate a new one |
 | `apc list` | `--source`, `--since`, `--until`, `--project`, `--session-id`, `--account`, `--limit` (20), `--offset` (0), `--json` | list captured prompts, newest first |
 | `apc search <query>` | `--source`, `--since`, `--until`, `--limit` (20), `--json` | FTS5 full-text search |
@@ -312,6 +312,17 @@ do not dedupe, because the hook reports `session_id` and `notify` reports `threa
 `apc doctor` prints a warning when it sees both. The `notify` payload arrives as the last
 argv argument with stdin closed, which is why `apc capture` accepts a trailing JSON argument.
 
+**Codex hook trust.** Codex discovers `hooks.json` but refuses to run anything in it until
+that hook has been trusted, so a freshly written `hooks.json` captures nothing on its own.
+Trust lives in the user layer's `~/.codex/config.toml`, under `[hooks.state]`, keyed by
+`"<absolute path of hooks.json>:<event_label>:<group_index>:<handler_index>"` with the
+SHA-256 of the hook's normalized identity as `trusted_hash`, which is why `apc install codex`
+writes those two entries for you and `apc doctor` re-checks them. Pass `apc install codex
+--no-trust` if you would rather Codex ask you itself: start `codex` once and its "hooks need
+review" screen offers "Trust all and continue" (`codex exec --dangerously-bypass-hook-trust`
+runs untrusted hooks for a single command). Change the hook command or its timeout and the
+hash changes with it, so re-run `apc install codex` after any edit to `hooks.json`.
+
 **OpenCode.** `apc install opencode` copies the plugin to
 `$XDG_CONFIG_HOME/opencode/plugin/agent-prompt-capture.js` (default
 `~/.config/opencode/plugin/`). It hooks `chat.message` for prompts and the `session.idle`
@@ -334,6 +345,32 @@ node extension/scripts/smoke.mjs          # loads the unpacked extension against
 
 uv run python scripts/e2e.py              # end-to-end run in a throwaway HOME
 ```
+
+### Testing Codex against OpenRouter
+
+Driving the real Codex CLI without an OpenAI account is the quickest way to check that the
+hooks fire and that trust is being written correctly. In the `CODEX_HOME` you are testing
+with, put this in `config.toml` next to the `[hooks.state]` entries `apc install codex`
+wrote:
+
+```toml
+model = "openai/gpt-5.6-luna"
+model_provider = "openrouter"
+[model_providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+env_key = "OPENROUTER_API_KEY"
+wire_api = "responses"
+```
+
+Then, with `OPENROUTER_API_KEY` exported:
+
+```sh
+codex exec --skip-git-repo-check "say hi" </dev/null
+```
+
+Redirecting stdin from `/dev/null` is not optional: `codex exec` waits on stdin otherwise
+and the run hangs. Check the result with `apc list --source codex_cli`.
 
 `scripts/e2e.py` drives the whole pipeline in a temporary `HOME`/`APC_HOME`: install the
 hooks, feed a hook payload through `apc capture`, POST one through the listener, then read

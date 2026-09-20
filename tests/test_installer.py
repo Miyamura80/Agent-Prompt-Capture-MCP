@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 
 import pytest
 
@@ -11,9 +12,13 @@ from agent_prompt_capture.installer import (
     CODEX_HOOK_COMMAND,
     CODEX_HOOK_EVENTS,
     HOOK_COMMAND,
+    HOOK_TIMEOUT,
     OPENCODE_PLUGIN_SOURCE,
+    ConfigFormatError,
     claude_settings_path,
     codex_config_path,
+    codex_hook_state_key,
+    codex_hook_trust_hash,
     codex_hooks_path,
     install,
     opencode_plugin_path,
@@ -205,7 +210,8 @@ def test_codex_install_writes_hooks_json():
         assert document["hooks"][event][0]["hooks"][0]["timeout"] == 10
         assert document["hooks"][event][0]["hooks"][0]["type"] == "command"
     assert "UserPromptSubmit" in message and "Stop" in message
-    assert not codex_config_path().exists()
+    # config.toml now exists, but only to carry the trust entries: no notify line.
+    assert "notify" not in codex_config_path().read_text()
 
 
 def test_codex_install_hooks_is_idempotent():
@@ -246,7 +252,9 @@ def test_codex_install_dry_run():
     message = install("codex", dry_run=True)
     assert "[dry-run]" in message
     assert CODEX_HOOK_COMMAND in message
+    assert "would trust 2 codex hook(s)" in message
     assert not codex_hooks_path().exists()
+    assert not codex_config_path().exists()
 
 
 def test_codex_install_honours_codex_home(monkeypatch, tmp_path):
@@ -348,6 +356,213 @@ def test_codex_uninstall_leaves_foreign_notify():
 
 def test_codex_uninstall_without_files():
     assert "nothing to remove" in uninstall("codex")
+
+
+# ---------------------------------------------------------------------------
+# codex hook trust: Codex ignores a hook until its hash is trusted in config.toml
+# ---------------------------------------------------------------------------
+
+#: Confirmed against the real Codex CLI 0.155.1 (2026-09-20) for `apc capture codex`
+#: with a timeout of 10. If these change, every hook we ever installed stops firing.
+PINNED_HASHES = {
+    "user_prompt_submit": (
+        "sha256:84bac188cd8cd2224b7d68e5b2bd25390fa243baea19406b97983e6cb3ef61bc"
+    ),
+    "stop": "sha256:d955e4abf3ea73d405f18346ddf4eb848ed4b574ac58c6635614ba260151f987",
+}
+
+
+def _trust_state(path=None) -> dict:
+    data = tomllib.loads((path or codex_config_path()).read_text(encoding="utf-8"))
+    return data.get("hooks", {}).get("state", {})
+
+
+def _our_keys() -> dict[str, str]:
+    return {label: codex_hook_state_key(codex_hooks_path(), label) for label in PINNED_HASHES}
+
+
+def test_codex_trust_hashes_are_pinned():
+    for label, digest in PINNED_HASHES.items():
+        assert codex_hook_trust_hash(label, CODEX_HOOK_COMMAND, HOOK_TIMEOUT) == digest
+
+
+def test_codex_trust_hash_changes_with_the_command_and_timeout():
+    other = codex_hook_trust_hash("stop", CODEX_HOOK_COMMAND, HOOK_TIMEOUT + 1)
+    assert other != PINNED_HASHES["stop"]
+    assert codex_hook_trust_hash("stop", "something-else", HOOK_TIMEOUT) != PINNED_HASHES["stop"]
+
+
+def test_codex_state_key_format(tmp_path):
+    key = codex_hook_state_key(tmp_path / "hooks.json", "stop")
+    assert key == f"{tmp_path / 'hooks.json'}:stop:0:0"
+    assert codex_hook_state_key(tmp_path / "hooks.json", "stop", 1, 2).endswith(":stop:1:2")
+
+
+def test_codex_install_writes_trust_entries_into_an_empty_config():
+    message = install("codex")
+    assert f"trusted codex hooks in {codex_config_path()} (2 entries)" in message
+    state = _trust_state()
+    assert len(state) == 2
+    for label, key in _our_keys().items():
+        assert state[key]["trusted_hash"] == PINNED_HASHES[label]
+
+
+def test_codex_install_trust_preserves_unrelated_config_byte_for_byte():
+    path = codex_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = 'model = "gpt-5.1-codex"\n\n[tui]\ntheme = "dark"\n'
+    path.write_text(original)
+    install("codex")
+    text = path.read_text()
+    assert text.startswith(original)
+    appended = text[len(original) :]
+    assert "[hooks.state." in appended
+    assert len(_trust_state()) == 2
+
+
+def test_codex_install_trust_keeps_an_existing_hooks_state_table():
+    path = codex_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        '[hooks.state]\n"/elsewhere/hooks.json:stop:0:0" = { trusted_hash = "sha256:other" }\n'
+    )
+    install("codex")
+    state = _trust_state()
+    assert state["/elsewhere/hooks.json:stop:0:0"]["trusted_hash"] == "sha256:other"
+    for label, key in _our_keys().items():
+        assert state[key]["trusted_hash"] == PINNED_HASHES[label]
+
+
+def test_codex_install_trust_updates_a_stale_inline_hash_in_place():
+    path = codex_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = codex_hook_state_key(codex_hooks_path(), "user_prompt_submit")
+    path.write_text(f'[hooks.state]\n"{key}" = {{ trusted_hash = "sha256:stale" }}\n')
+    install("codex")
+    text = path.read_text()
+    assert "sha256:stale" not in text
+    assert text.count(f'"{key}"') == 1  # updated in place, not duplicated
+    assert _trust_state()[key]["trusted_hash"] == PINNED_HASHES["user_prompt_submit"]
+
+
+def test_codex_install_trust_updates_a_stale_table_header_hash_in_place():
+    path = codex_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = codex_hook_state_key(codex_hooks_path(), "stop")
+    path.write_text(f'[hooks.state."{key}"]\ntrusted_hash = "sha256:stale"\n')
+    install("codex")
+    text = path.read_text()
+    assert "sha256:stale" not in text
+    assert text.count(f'[hooks.state."{key}"]') == 1
+    assert _trust_state()[key]["trusted_hash"] == PINNED_HASHES["stop"]
+
+
+def test_codex_install_trust_is_idempotent_over_three_runs():
+    install("codex")
+    first = codex_config_path().read_text()
+    second_message = install("codex")
+    third_message = install("codex")
+    assert codex_config_path().read_text() == first
+    assert "already trusted" in second_message
+    assert second_message == third_message
+    assert len(_trust_state()) == 2
+
+
+def test_codex_install_trust_follows_the_real_group_index():
+    path = codex_hooks_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {"hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command", "command": "other"}]}]}}
+        )
+    )
+    install("codex")
+    state = _trust_state()
+    # ours landed in group 1 for UserPromptSubmit, group 0 for Stop
+    assert codex_hook_state_key(path, "user_prompt_submit", 1, 0) in state
+    assert codex_hook_state_key(path, "stop", 0, 0) in state
+
+
+def test_codex_install_no_trust_writes_no_entries():
+    message = install("codex", trust=False)
+    assert not codex_config_path().exists()
+    assert "Trust all and continue" in message
+    assert len(message.splitlines()) == 2
+
+
+def test_codex_uninstall_removes_trust_entries_and_leaves_others():
+    path = codex_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        'model = "gpt-5.1-codex"\n\n[hooks.state]\n'
+        '"/elsewhere/hooks.json:stop:0:0" = { trusted_hash = "sha256:other" }\n'
+    )
+    install("codex")
+    message = uninstall("codex")
+    assert "removed codex hook trust entries (2)" in message
+    state = _trust_state()
+    assert list(state) == ["/elsewhere/hooks.json:stop:0:0"]
+    text = path.read_text()
+    assert 'model = "gpt-5.1-codex"' in text
+    for key in _our_keys().values():
+        assert key not in text
+
+
+def test_codex_uninstall_removes_inline_trust_entries():
+    install("codex")
+    keys = _our_keys()
+    path = codex_config_path()
+    path.write_text(
+        "[hooks.state]\n"
+        + "".join(
+            f'"{key}" = {{ trusted_hash = "{PINNED_HASHES[label]}" }}\n'
+            for label, key in keys.items()
+        )
+    )
+    uninstall("codex")
+    assert _trust_state() == {}
+
+
+def test_codex_uninstall_leaves_a_foreign_trust_entry_for_our_path():
+    install("codex")
+    key = codex_hook_state_key(codex_hooks_path(), "stop")
+    path = codex_config_path()
+    path.write_text(f'[hooks.state."{key}"]\ntrusted_hash = "sha256:not-ours"\n')
+    message = uninstall("codex")
+    assert "no codex hook trust entries" in message
+    assert _trust_state()[key]["trusted_hash"] == "sha256:not-ours"
+
+
+def test_codex_uninstall_survives_a_malformed_config_toml():
+    """A config we cannot parse must not stop hooks.json from being cleaned up."""
+    install("codex")
+    path = codex_config_path()
+    path.write_text('model = "unterminated\nnope\n')
+    message = uninstall("codex")
+    assert "removed codex hooks" in message
+    assert "could not read the codex hook trust entries" in message
+
+
+def test_codex_install_refuses_to_write_when_an_entry_cannot_be_updated():
+    """A dotted top-level spelling we cannot edit must not become a duplicate key."""
+    path = codex_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = codex_hook_state_key(codex_hooks_path(), "stop")
+    original = f'hooks.state."{key}".trusted_hash = "sha256:stale"\n'
+    path.write_text(original)
+    with pytest.raises(ConfigFormatError, match="refusing to write"):
+        install("codex")
+    assert path.read_text() == original
+
+
+def test_codex_install_refuses_a_malformed_config_toml():
+    path = codex_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = 'model = "unterminated\nnope\n'
+    path.write_text(original)
+    with pytest.raises(ConfigFormatError, match="not valid TOML"):
+        install("codex")
+    assert path.read_text() == original
 
 
 # ---------------------------------------------------------------------------

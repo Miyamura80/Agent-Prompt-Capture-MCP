@@ -260,6 +260,51 @@ Default timeout (`discovery.rs`, `normalize_command_hook`): `timeout_sec.unwrap_
 for every event except `SessionEnd`/`Interrupt`, which use their own clamped default.
 Note Codex does **not** lower the default for `UserPromptSubmit` the way Claude Code does.
 
+#### Hook trust (**Verified live 2026-09-20**, Codex CLI 0.155.1)
+
+Writing `hooks.json` is **not enough**. Codex discovers the file but never executes a hook
+until that hook's identity hash has been persisted as trusted; with our two hooks installed
+and no trust entry, the real binary ran neither of them and offered a "hooks need review"
+screen on the next interactive start ("Trust all and continue" trusts them all).
+`codex exec --dangerously-bypass-hook-trust` runs untrusted hooks without persisting
+anything.
+
+Trust state lives in the **USER layer `config.toml`** (`$CODEX_HOME/config.toml`), in a
+`hooks.state` table keyed by
+`"<absolute path of hooks.json>:<event_label>:<group_index>:<handler_index>"`:
+
+```toml
+[hooks.state]
+"/Users/alice/.codex/hooks.json:user_prompt_submit:0:0" = { trusted_hash = "sha256:..." }
+"/Users/alice/.codex/hooks.json:stop:0:0" = { trusted_hash = "sha256:..." }
+```
+
+The event label is the snake_case of the PascalCase event name: `UserPromptSubmit` ->
+`user_prompt_submit`, `Stop` -> `stop`. The group and handler indices are the hook's
+position in `hooks.json`, so a hook appended after somebody else's group is `...:1:0`, not
+`...:0:0`.
+
+The hash is `"sha256:" + sha256(canonical_json)`, where `canonical_json` is compact
+(`separators=(",", ":")`) and recursively key-sorted JSON of the normalized identity:
+
+```python
+{"event_name": "<label>", "hooks": [{"async": False, "command": "<command>", "timeout": <int>, "type": "command"}]}
+```
+
+`matcher` is omitted when it is null, `timeout` is the configured timeout (600 when the
+config leaves it out), and every other optional field is omitted when unset. Two values
+confirmed against the running binary for command `apc capture codex` with `timeout` 10:
+
+| event label | trusted_hash |
+|---|---|
+| `user_prompt_submit` | `sha256:84bac188cd8cd2224b7d68e5b2bd25390fa243baea19406b97983e6cb3ef61bc` |
+| `stop` | `sha256:d955e4abf3ea73d405f18346ddf4eb848ed4b574ac58c6635614ba260151f987` |
+
+Consequences for us: `apc install codex` writes these entries itself (`--no-trust` opts
+out), the hash must be computed from the exact command and timeout the installer writes so
+the two cannot drift, and `apc doctor` reports installed-but-untrusted hooks, including the
+case where the keys name a `hooks.json` at a path we are no longer using.
+
 ### 2.3 Exact stdin payload for the user-prompt event
 
 `codex-rs/hooks/schema/generated/user-prompt-submit.command.input.schema.json`
