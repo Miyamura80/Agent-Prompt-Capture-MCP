@@ -89,12 +89,27 @@ function spawnDetached(json) {
   return new Promise((resolve) => {
     let settled = false;
     let timer = null;
+    let kill = null; // set once a child exists; called if it outlives the timer
 
     function done() {
       if (settled) return;
       settled = true;
       if (timer !== null) clearTimeout(timer);
       resolve();
+    }
+
+    function expire() {
+      // A capture writes one row; a child still alive after SPAWN_TIMEOUT_MS never
+      // finishes, so terminate it rather than rely on unref() alone (older Bun
+      // builds have no unref, and a hung child must not keep OpenCode alive).
+      if (kill !== null) {
+        try {
+          kill();
+        } catch (_) {
+          // already gone
+        }
+      }
+      done();
     }
 
     // The child is unref'd below (a hung `apc capture` must never keep OpenCode
@@ -104,7 +119,7 @@ function spawnDetached(json) {
     // still fire while the timer runs, and done() clears the timer, so a healthy
     // child releases the host as soon as it exits and a hung one after
     // SPAWN_TIMEOUT_MS. The timer itself is deliberately NOT unref'd.
-    timer = setTimeout(done, SPAWN_TIMEOUT_MS);
+    timer = setTimeout(expire, SPAWN_TIMEOUT_MS);
 
     // Bun first (OpenCode's server runs on Bun), node:child_process otherwise.
     let spawned = null;
@@ -124,11 +139,12 @@ function spawnDetached(json) {
     }
 
     if (spawned) {
+      kill = () => spawned.kill();
       try {
         // Detach from the host's event loop: a hung child must not keep it alive.
         if (typeof spawned.unref === "function") spawned.unref();
       } catch (_) {
-        // older Bun without unref(); the 10 s timer is still the backstop
+        // older Bun without unref(): expire() kills the child on timeout instead
       }
       try {
         spawned.stdin.write(json);
@@ -152,15 +168,19 @@ function spawnDetached(json) {
           stdio: ["pipe", "ignore", "ignore"],
           detached: true,
         });
+        kill = () => child.kill();
         // Detach from the host's event loop: a hung child must not keep it alive.
         // The SPAWN_TIMEOUT_MS timer above, not the child, is what keeps a
-        // short-lived host running long enough to see "close".
+        // short-lived host running long enough to see "close". The stdin pipe is
+        // unref'd too, or a large prompt the child never drains would keep the
+        // pending write (and the host) referenced.
         child.unref();
         // A missing `apc` surfaces as an async "error" event, never a throw.
         child.on("error", () => done());
         child.on("close", () => done());
         if (child.stdin) {
           child.stdin.on("error", () => {});
+          if (typeof child.stdin.unref === "function") child.stdin.unref();
           // end() both writes and closes the pipe; "close" fires once the child exits.
           child.stdin.end(json);
         }
