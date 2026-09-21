@@ -10,8 +10,26 @@ export const EMAIL_PATTERN = /[A-Za-z0-9._%+-]+@[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za
 
 /**
  * Token shapes we redact. Ordered most specific first; every one of them maps
- * to the single placeholder [API_KEY] (the server emits the numbered
- * [API_KEY_1] style placeholders, we only need to stop the raw secret leaving).
+ * to the single placeholder [API_KEY].
+ *
+ * Why these markers are flat and not numbered like the server's
+ * ([EMAIL_1], [API_KEY_2], ... - see pii._apply):
+ *
+ *   - the server cannot renumber or count what we replaced. By the time the
+ *     payload reaches `apc serve` the raw value is gone, so a client-scrubbed
+ *     email is invisible to `scrub()` and never appears in the record's
+ *     `pii_findings`. That is true whatever marker we write.
+ *   - writing [EMAIL_1] anyway would be actively wrong: the server numbers
+ *     from 1 per record, over the text we hand it. Its api_key patterns are
+ *     wider than ours (Bearer ..., password = ..., stripe-style keys), so a
+ *     value we missed becomes [API_KEY_1] too - the same placeholder standing
+ *     for two different secrets in one prompt.
+ *
+ * A flat marker cannot collide with [CATEGORY_N], so a reader can always tell
+ * which side scrubbed what. The cost, documented in extension/README.md, is
+ * that browser captures lose per-value identity (two different addresses both
+ * read [EMAIL]) and contribute nothing to `pii_findings`. The listener's scrub
+ * is still the one that decides what is persisted.
  */
 export const TOKEN_PATTERNS = [
   /sk-ant-[A-Za-z0-9_-]{16,}/g,

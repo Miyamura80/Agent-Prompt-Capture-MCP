@@ -404,3 +404,86 @@ def test_migrating_a_v1_database_rebuilds_the_search_index(apc_home):
         assert upgraded.mark_turn_end(Source.CLAUDE_CODE, None) is None
     finally:
         upgraded.close()
+
+
+# ---------------------------------------------------------------------------
+# regressions
+# ---------------------------------------------------------------------------
+
+
+def test_the_runtime_directory_is_created_private(tmp_path):
+    """The prompt archive is private: its directory is 0700, not umask-dependent."""
+    import stat
+
+    home = tmp_path / "fresh-home"
+    assert not home.exists()
+    fresh = Store(home / "prompts.db")
+    try:
+        assert stat.S_IMODE(home.stat().st_mode) == 0o700
+    finally:
+        fresh.close()
+
+
+def test_mark_turn_end_survives_a_malformed_timestamp(store):
+    record = make_record("a", ts="2026-09-19T10:00:00.000Z", session_id="s1")
+    store.insert(record)
+    assert store.mark_turn_end(Source.CLAUDE_CODE, "s1", "last tuesday") == record.id
+    ended = store.get(record.id).turn_end_ts
+    assert ended is not None and ended >= record.ts
+
+
+def test_mark_turn_end_ignores_a_wildly_future_client_clock(store):
+    record = make_record("a", ts="2026-09-19T10:00:00.000Z", session_id="s1")
+    store.insert(record)
+    store.mark_turn_end(Source.CLAUDE_CODE, "s1", "2099-01-01T00:00:00.000Z")
+    assert store.get(record.id).turn_end_ts < "2099"
+
+
+def test_mark_turn_end_never_ends_a_turn_before_it_started(store):
+    record = make_record("a", ts="2026-09-19T10:00:00.000Z", session_id="s1")
+    store.insert(record)
+    store.mark_turn_end(Source.CLAUDE_CODE, "s1", "2026-09-19T09:00:00.000Z")
+    assert store.get(record.id).turn_end_ts == record.ts
+
+
+def test_concurrent_writers_cannot_both_insert_the_same_prompt(apc_home):
+    """Two connections racing on one database still honour the 5 s dedup window.
+
+    The slow writer is paused between its dedup check and its INSERT, which is exactly
+    the window a second process used to slip through.
+    """
+    import threading
+    import time
+
+    path = apc_home / "prompts.db"
+    slow, fast = Store(path), Store(path)
+    checked = threading.Event()
+    original = slow._is_duplicate
+
+    def paused_check(rec):
+        result = original(rec)
+        checked.set()  # the other writer may try now ...
+        time.sleep(0.3)  # ... and must not get in before this insert commits
+        return result
+
+    slow._is_duplicate = paused_check
+    results: dict[str, bool] = {}
+
+    def run_slow() -> None:
+        results["slow"] = slow.insert(
+            make_record("same text", ts="2026-09-19T10:00:00.000Z", id="race-slow")
+        )
+
+    try:
+        thread = threading.Thread(target=run_slow)
+        thread.start()
+        assert checked.wait(5)
+        results["fast"] = fast.insert(
+            make_record("same text", ts="2026-09-19T10:00:02.000Z", id="race-fast")
+        )
+        thread.join(10)
+        assert list(results.values()).count(True) == 1
+        assert fast.count() == 1
+    finally:
+        for db in (slow, fast):
+            db.close()

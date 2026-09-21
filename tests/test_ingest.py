@@ -182,7 +182,12 @@ def test_source_accepts_a_string(config, store):
 
 
 def test_claude_code_stop_marks_the_turn_end(config, store):
-    record = ingest(Source.CLAUDE_CODE, CLAUDE, config=config, store=store)
+    record = ingest(
+        Source.CLAUDE_CODE,
+        {**CLAUDE, "ts": "2026-09-19T20:00:00.000Z"},
+        config=config,
+        store=store,
+    )
     result = ingest(
         Source.CLAUDE_CODE,
         {"session_id": "abc123", "hook_event_name": "Stop", "ts": "2026-09-19T21:00:00.000Z"},
@@ -196,7 +201,7 @@ def test_claude_code_stop_marks_the_turn_end(config, store):
 def test_opencode_turn_end_event(config, store):
     record = ingest(
         Source.OPENCODE,
-        {"prompt": "do a thing", "session_id": "ses_1"},
+        {"prompt": "do a thing", "session_id": "ses_1", "ts": "2026-09-19T20:00:00.000Z"},
         config=config,
         store=store,
     )
@@ -279,13 +284,16 @@ def test_a_huge_prompt_is_truncated_and_says_so(config, store):
     assert record.metadata["prompt_original_chars"] == MAX_PROMPT_CHARS + 5_000
 
 
-def test_a_truncated_prompt_hashes_what_we_stored(config, store):
+def test_a_truncated_prompt_hashes_the_text_that_was_scrubbed(config, store):
+    """The hash covers the raw text handed to the scrubber, not the stored excerpt."""
     from agent_prompt_capture.ingest import MAX_PROMPT_CHARS
+    from agent_prompt_capture.pii import MAX_SCRUB_CHARS
 
     text = "y" * (MAX_PROMPT_CHARS + 10)
     record = ingest(Source.CLAUDE_CODE, {**CLAUDE, "prompt": text}, config=config, store=store)
-    expected = hashlib.sha256(text[:MAX_PROMPT_CHARS].encode()).hexdigest()
+    expected = hashlib.sha256(text[:MAX_SCRUB_CHARS].encode()).hexdigest()
     assert record.prompt_hash == expected
+    assert record.char_count == MAX_PROMPT_CHARS
 
 
 def test_a_normal_prompt_is_not_marked_truncated(config, store):
@@ -385,3 +393,94 @@ def test_a_turn_end_before_the_prompt_is_clamped(config, store):
 def test_every_adapter_rejects_a_non_object_payload(config, store, source, payload):
     with pytest.raises(AdapterError):
         ingest(source, payload, config=config, store=store)
+
+
+def test_a_secret_straddling_the_stored_cap_is_never_stored_raw(config, store):
+    """Scrub first, truncate second: the old order left the secret's prefix behind."""
+    from agent_prompt_capture.ingest import MAX_PROMPT_CHARS
+
+    secret = "ghp_" + "A" * 24
+    # the token starts 10 characters before the stored cap and runs past it
+    text = "x" * (MAX_PROMPT_CHARS - 11) + " " + secret + " trailing words"
+    record = ingest(Source.CLAUDE_CODE, {**CLAUDE, "prompt": text}, config=config, store=store)
+
+    assert record is not None
+    assert "ghp_" not in record.prompt
+    assert record.pii_findings.get("api_key") == 1
+    assert record.metadata["prompt_truncated"] is True
+
+
+def test_nested_metadata_keys_are_scrubbed(config, store):
+    from agent_prompt_capture.adapters import RawPrompt
+    from agent_prompt_capture.ingest import _ingest_prompt
+
+    raw = RawPrompt(
+        prompt="check the invite list",
+        session_id="s1",
+        metadata={"counts": {"alice@example.com": 3}, "top": [{"bob@example.com": "x"}]},
+    )
+    record = _ingest_prompt(Source.CLAUDE_CODE, raw, config=config, store=store)
+
+    blob = json.dumps(record.metadata)
+    assert "alice@example.com" not in blob
+    assert "bob@example.com" not in blob
+    assert "[EMAIL_1]" in blob
+
+
+def test_a_turn_end_matches_the_scrubbed_session_id(config, store):
+    """Prompt rows store the scrubbed id, so the Stop event has to look it up scrubbed."""
+    session = "alice@example.com/42"
+    record = ingest(
+        Source.CLAUDE_CODE,
+        {**CLAUDE, "session_id": session},
+        config=config,
+        store=store,
+    )
+    assert record.session_id is not None and "alice@example.com" not in record.session_id
+
+    ingest(
+        Source.CLAUDE_CODE,
+        {"hook_event_name": "Stop", "session_id": session},
+        config=config,
+        store=store,
+    )
+    assert store.get(record.id).turn_end_ts is not None
+
+
+def test_a_turn_end_with_a_future_clock_falls_back_to_our_own(config, store):
+    record = ingest(Source.CLAUDE_CODE, CLAUDE, config=config, store=store)
+    future = to_iso(datetime.now(UTC) + timedelta(days=3))
+    ingest(
+        Source.CLAUDE_CODE,
+        {"hook_event_name": "Stop", "session_id": CLAUDE["session_id"], "ts": future},
+        config=config,
+        store=store,
+    )
+    ended = store.get(record.id).turn_end_ts
+    assert ended is not None and ended < future
+
+
+def test_a_turn_end_with_a_malformed_clock_still_closes_the_turn(config, store):
+    record = ingest(Source.CLAUDE_CODE, CLAUDE, config=config, store=store)
+    ingest(
+        Source.CLAUDE_CODE,
+        {"hook_event_name": "Stop", "session_id": CLAUDE["session_id"], "ts": "last tuesday"},
+        config=config,
+        store=store,
+    )
+    ended = store.get(record.id).turn_end_ts
+    assert ended is not None and ended >= record.ts
+
+
+def test_a_carried_turn_end_with_a_malformed_clock_does_not_raise(config, store):
+    """The Codex notify payload carries its own end timestamp."""
+    payload = {
+        "type": "agent-turn-complete",
+        "thread-id": "t-1",
+        "cwd": "/Users/alice/dev/proj",
+        "input-messages": ["do the thing"],
+        "ts": "whenever",
+    }
+    record = ingest(Source.CODEX_CLI, payload, config=config, store=store)
+    assert record is not None
+    assert record.turn_end_ts is not None and record.turn_end_ts >= record.ts

@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import pytest
 
-from agent_prompt_capture.adapters import AdapterError, RawPrompt, RawTurnEnd
+from agent_prompt_capture.adapters import (
+    AdapterError,
+    RawPrompt,
+    RawTurnEnd,
+    project_from_cwd,
+)
 from agent_prompt_capture.adapters import browser as browser_adapter
 from agent_prompt_capture.adapters import claude_code as cc
 from agent_prompt_capture.adapters import codex as codex_adapter
@@ -414,3 +419,45 @@ def test_the_real_plugin_turn_end_round_trips():
     assert isinstance(parsed, RawTurnEnd)
     assert parsed.session_id == "sess-1"
     assert parsed.ts == "2026-09-19T21:10:52.985Z"
+
+
+# ---------------------------------------------------------------------------
+# regressions
+# ---------------------------------------------------------------------------
+
+
+def test_claude_code_stop_with_background_work_is_not_a_turn_end():
+    """hook-specs.md 6.a: a non-empty ``background_tasks`` means "still busy"."""
+    payload = {
+        "session_id": "abc123",
+        "hook_event_name": "Stop",
+        "background_tasks": [{"id": "task-001", "status": "running"}],
+    }
+    assert cc.parse(payload) is None
+    assert isinstance(cc.parse({**payload, "background_tasks": []}), RawTurnEnd)
+    assert isinstance(cc.parse({**payload, "background_tasks": None}), RawTurnEnd)
+
+
+@pytest.mark.parametrize(
+    "cwd", ["/home/alice", "/Users/alice", "C:\\Users\\alice", "/root", "/home/alice/"]
+)
+def test_a_home_directory_root_is_not_a_project(cwd):
+    assert project_from_cwd(cwd) is None
+    assert cc.parse({**CLAUDE_PAYLOAD, "cwd": cwd}).project is None
+    assert codex_adapter.parse({**CODEX_HOOK, "cwd": cwd}).project is None
+    assert oc.parse({"prompt": "x", "cwd": cwd}).project is None
+
+
+@pytest.mark.parametrize(
+    ("cwd", "expected"),
+    [
+        ("/home/alice/dev/proj", "proj"),
+        ("/Users/alice/proj", "proj"),
+        ("C:\\Users\\alice\\proj", "proj"),
+        ("/srv/app", "app"),
+        ("/home", "home"),
+        (None, None),
+    ],
+)
+def test_project_from_cwd_keeps_real_projects(cwd, expected):
+    assert project_from_cwd(cwd) == expected

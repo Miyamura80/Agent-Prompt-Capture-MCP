@@ -37,14 +37,21 @@
     return APC.stripTitleSuffix(document.title, [' | ChatGPT', ' - ChatGPT', ' – ChatGPT']);
   }
 
+  /**
+   * The signed-in account, or null.
+   *
+   * Only `user.email` from /api/auth/session counts. A deep search of the
+   * session payload would happily return an unrelated nested address (an
+   * organisation contact, a workspace owner, a shared-project member) and the
+   * allowlist would then authorise *this* user's prompts under someone else's
+   * identity. The contract is allowlisted accounts only, so a wrong guess is
+   * worse than returning null and capturing nothing.
+   */
   function detectAccount() {
     return APC.fetchJson('/api/auth/session')
       .then(function (data) {
-        if (data && data.user && typeof data.user.email === 'string') {
-          var direct = APC.normaliseEmail(data.user.email);
-          if (direct) return direct;
-        }
-        return APC.findEmailInObject(data);
+        if (!data || !data.user) return null;
+        return APC.normaliseEmail(data.user.email) || null;
       })
       .catch(function () {
         return null;

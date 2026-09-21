@@ -46,6 +46,9 @@ const SITE_URL = `https://chatgpt.com/c/${CONVERSATION_ID}`;
 const CLAUDE_SESSION_ID = 'sess-abc123def';
 const CLAUDE_URL = `https://claude.ai/code/session/${CLAUDE_SESSION_ID}`;
 const SECRET_EMAIL = 'leaked.person@example.com';
+// Another member of the same organisation. It must never be mistaken for the
+// signed-in user: the allowlist contract says a wrong identity is worse than none.
+const DECOY_EMAIL = 'colleague@example.com';
 const LINE_ONE = 'summarise the changelog';
 const LINE_TWO = `and cc ${SECRET_EMAIL}`;
 
@@ -77,13 +80,20 @@ if (!process.env.DISPLAY && !process.env.APC_SMOKE_NO_XVFB) {
 
 /* ------------------------------------------------------- playwright lookup */
 
-process.env.PLAYWRIGHT_BROWSERS_PATH ||= '/opt/pw-browsers';
+// Only override playwright's own browser cache when this machine actually keeps
+// the browsers in /opt (CI images do). Forcing the override on a clean checkout
+// points chromium lookup at a directory that does not exist and the launch fails.
+if (!process.env.PLAYWRIGHT_BROWSERS_PATH && existsSync('/opt/pw-browsers')) {
+  process.env.PLAYWRIGHT_BROWSERS_PATH = '/opt/pw-browsers';
+}
 
 async function loadPlaywright() {
   try {
+    // extension/package.json declares playwright as a devDependency:
+    // `npm install` in extension/ makes this the resolvable copy.
     return await import('playwright');
   } catch {
-    /* not resolvable from here; fall through to the global install */
+    /* not installed here; fall back to a global install before giving up */
   }
   let globalRoot = '';
   try {
@@ -98,12 +108,15 @@ async function loadPlaywright() {
     const req = createRequire(join(root, 'noop.js'));
     return req('playwright');
   }
-  throw new Error(`Could not resolve the playwright package (looked in: ${candidates.join(', ')})`);
+  throw new Error(
+    'Could not resolve the playwright package. Run `npm install` in extension/ ' +
+      `(looked in: ${candidates.join(', ')})`,
+  );
 }
 
 /* ------------------------------------------------------------ local server */
 
-const received = { prompts: [], health: 0, config: 0, session: 0, organizations: 0, account: 0, unauthorised: 0 };
+const received = { prompts: [], health: 0, config: 0, session: 0, currentAccount: 0, account: 0, unauthorised: 0 };
 // The fixture the catch-all serves; flipped when the claude phase starts.
 let currentFixture = FIXTURE_CHATGPT;
 
@@ -137,16 +150,21 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // claude.ai account endpoints: both 404 so the smoke test exercises the
-  // DOM fallback (and proves two dead endpoints are handled gracefully).
-  if (url.pathname === '/api/organizations') {
-    received.organizations += 1;
+  // claude.ai account endpoints.
+  //   /api/auth/current_account 404s (a dead endpoint must degrade to "unknown")
+  //   /api/account answers with an org roster and NO current-user field, which is
+  //   the shape that used to make the old deep search return a colleague's address
+  // so the run ends up on the DOM fallback, which reads the viewer's own popover.
+  if (url.pathname === '/api/auth/current_account') {
+    received.currentAccount += 1;
     json(res, 404, { error: 'not found' });
     return;
   }
-  if (url.pathname === '/api/account' || url.pathname === '/api/bootstrap') {
+  if (url.pathname === '/api/account') {
     received.account += 1;
-    json(res, 404, { error: 'not found' });
+    json(res, 200, {
+      organization: { name: 'Acme', members: [{ email: DECOY_EMAIL }, { email: ACCOUNT }] },
+    });
     return;
   }
 
@@ -433,8 +451,8 @@ async function main() {
   await claudePage.goto(CLAUDE_URL, { waitUntil: 'domcontentloaded' });
   await claudePage.waitForSelector('fieldset div[contenteditable="true"]');
   await claudePage.waitForTimeout(1500);
-  check('claude account endpoints were tried and 404d', received.organizations > 0 && received.account > 0,
-    `orgs: ${received.organizations}, account: ${received.account}`);
+  check('claude current-account endpoints were tried', received.currentAccount > 0 && received.account > 0,
+    `current_account: ${received.currentAccount}, account: ${received.account}`);
 
   const before = await delivered();
   await claudePage.click('fieldset div[contenteditable="true"]');
@@ -454,6 +472,11 @@ async function main() {
   });
   check('claude whoami maps /code/* to claude_code_web', claudeWhoami && claudeWhoami.source === 'claude_code_web', JSON.stringify(claudeWhoami && claudeWhoami.source));
   check('claude DOM fallback found the account', claudeWhoami && claudeWhoami.account === ACCOUNT, JSON.stringify(claudeWhoami && claudeWhoami.account));
+  check(
+    'no org-roster address was mistaken for the signed-in user',
+    !!claudeWhoami && claudeWhoami.account !== DECOY_EMAIL,
+    JSON.stringify(claudeWhoami && claudeWhoami.account),
+  );
   check('claude conversation id is the last id-like segment', claudeWhoami && claudeWhoami.conversationId === CLAUDE_SESSION_ID, JSON.stringify(claudeWhoami && claudeWhoami.conversationId));
   check('claude title drops the " - Claude" suffix', claudeWhoami && claudeWhoami.title === 'Refactor the parser', JSON.stringify(claudeWhoami && claudeWhoami.title));
 
@@ -470,6 +493,73 @@ async function main() {
     check('claude session id is right', body.conversation_id === CLAUDE_SESSION_ID, JSON.stringify(body.conversation_id));
     check('claude title is right', body.title === 'Refactor the parser', JSON.stringify(body.title));
   }
+
+  // 8. the worker talks to loopback or to nothing: a non-local serverUrl must be
+  //    refused before any fetch, and must not sit in the retry queue either.
+  const beforeRemote = await delivered();
+  const remote = await optionsPage.evaluate(async () => {
+    await chrome.storage.sync.set({ serverUrl: 'https://not-local.example.com' });
+    const res = await new Promise((r) =>
+      chrome.runtime.sendMessage(
+        {
+          type: 'capture',
+          payload: {
+            source: 'chatgpt_web',
+            prompt: 'this must never leave the machine',
+            account: 'me@work.com',
+            url: 'https://chatgpt.com/c/x',
+            ts: new Date().toISOString(),
+          },
+        },
+        r,
+      ),
+    );
+    const status = await new Promise((r) => chrome.runtime.sendMessage({ type: 'status' }, r));
+    return { res, queued: status && status.queued };
+  });
+  check(
+    'a non-loopback serverUrl is refused by the worker',
+    remote && remote.res && remote.res.ok === false && remote.res.reason === 'server_not_loopback',
+    JSON.stringify(remote && remote.res),
+  );
+  check('a refused non-loopback capture is not queued', remote && remote.queued === 0, JSON.stringify(remote && remote.queued));
+  mockCheck('nothing extra reached the listener', (await delivered()) === beforeRemote, `delivered: ${await delivered()}`);
+  await optionsPage.evaluate((url) => chrome.storage.sync.set({ serverUrl: url }), listenerUrl);
+
+  // 9. the options UI enforces the same rule (and loading it at all proves the
+  //    page's module script resolved lib/limits.js).
+  const uiPage = await context.newPage();
+  await uiPage.goto(`chrome-extension://${extensionId}/options.html`);
+  const uiLoaded = await uiPage
+    .waitForFunction(() => document.getElementById('serverUrl').value.length > 0, { timeout: 10000 })
+    .then(() => true, () => false);
+  check('options page script ran and loaded the saved settings', uiLoaded);
+
+  const saveUrl = async (value) => {
+    await uiPage.evaluate(() => {
+      document.getElementById('status').textContent = '';
+    });
+    await uiPage.fill('#serverUrl', value);
+    await uiPage.click('#save');
+    await waitFor('options status', async () => ((await uiPage.textContent('#status')) || '').length > 0, 5000);
+    return (await uiPage.textContent('#status')) || '';
+  };
+
+  check(
+    'options page refuses a non-loopback host',
+    /127\.0\.0\.1 or localhost/.test(await saveUrl('http://not-local.example.com')),
+    'no loopback complaint',
+  );
+  check(
+    'options page refuses https, even on loopback',
+    /http:\/\//.test(await saveUrl('https://127.0.0.1:47821')),
+    'no scheme complaint',
+  );
+  const storedUrl = await uiPage.evaluate(
+    () => new Promise((r) => chrome.storage.sync.get({ serverUrl: '' }, (v) => r(v.serverUrl))),
+  );
+  check('a rejected URL never reaches chrome.storage.sync', storedUrl === listenerUrl, JSON.stringify(storedUrl));
+  check('options page accepts the loopback listener', /Saved/.test(await saveUrl(listenerUrl)), 'not saved');
 }
 
 main()

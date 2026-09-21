@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import secrets
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
@@ -91,13 +92,23 @@ def rotate_token(home: Path | None = None) -> str:
     ensure_home(target)
     path = token_path(target)
     token = secrets.token_urlsafe(32)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(token + "\n", encoding="utf-8")
+    # A fixed ``token.tmp`` name can be pre-created as a symlink by another user on a
+    # shared machine, which would send the fresh token to the link's target. ``mkstemp``
+    # creates a fresh, unique file with ``O_CREAT|O_EXCL`` (no symlink is ever followed)
+    # at mode 0600, and ``os.replace`` puts it in place atomically.
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    tmp = Path(tmp_name)
     try:
-        tmp.chmod(0o600)
-    except OSError:  # pragma: no cover
-        pass
-    tmp.replace(path)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(token + "\n")
+        try:
+            tmp.chmod(0o600)
+        except OSError:  # pragma: no cover
+            pass
+        os.replace(tmp, path)
+    except BaseException:  # pragma: no cover - defensive cleanup
+        tmp.unlink(missing_ok=True)
+        raise
     try:
         path.chmod(0o600)
     except OSError:  # pragma: no cover

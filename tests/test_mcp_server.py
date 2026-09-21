@@ -304,3 +304,40 @@ async def test_resources_return_json(mcp, uri):
         result = await client.read_resource(uri)
     text = result.contents[0].text
     assert isinstance(json.loads(text), dict)
+
+
+async def test_build_server_omits_version_on_an_mcp_1x_constructor(apc_home, store, monkeypatch):
+    """mcp 1.x ``FastMCP`` has no ``version`` keyword and raises ``TypeError`` on one."""
+    from agent_prompt_capture import mcp_server as module
+
+    seen: dict[str, object] = {}
+
+    class FakeFastMCP:
+        def __init__(self, name=None, instructions=None):
+            seen["name"] = name
+            seen["instructions"] = instructions
+
+        def tool(self, *args, **kwargs):
+            return lambda fn: fn
+
+        def resource(self, *args, **kwargs):
+            return lambda fn: fn
+
+    monkeypatch.setattr(module, "_server_class", lambda: FakeFastMCP)
+    server = module.build_server(Config(home=apc_home), store)
+
+    assert isinstance(server, FakeFastMCP)
+    assert seen["name"] == "agent-prompt-capture"
+    assert seen["instructions"]
+
+
+async def test_build_server_passes_version_when_the_constructor_takes_one(apc_home, store):
+    """The installed SDK (mcp 2.x ``MCPServer``) still advertises our version."""
+    import inspect
+
+    from agent_prompt_capture import __version__
+    from agent_prompt_capture.mcp_server import _server_class
+
+    server = build_server(Config(home=apc_home), store)
+    if "version" in inspect.signature(_server_class().__init__).parameters:
+        assert getattr(server, "version", __version__) == __version__

@@ -6,6 +6,7 @@ MCP frames themselves; everything else goes to ``$APC_HOME/apc.log``.
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Iterable
 from typing import Any
@@ -170,11 +171,15 @@ def build_server(config: Config | None = None, store: Store | None = None) -> An
     db = store if store is not None else Store(cfg.db_path)
 
     server_cls = _server_class()
-    server = server_cls(
-        name="agent-prompt-capture",
-        version=__version__,
-        instructions=INSTRUCTIONS,
-    )
+    kwargs: dict[str, Any] = {
+        "name": "agent-prompt-capture",
+        "instructions": INSTRUCTIONS,
+    }
+    if "version" in inspect.signature(server_cls.__init__).parameters:
+        # mcp 2.x ``MCPServer`` advertises a server version; mcp 1.x ``FastMCP`` has no
+        # such keyword and raises ``TypeError`` when one is passed.
+        kwargs["version"] = __version__
+    server = server_cls(**kwargs)
 
     # ------------------------------------------------------------------
     # tools

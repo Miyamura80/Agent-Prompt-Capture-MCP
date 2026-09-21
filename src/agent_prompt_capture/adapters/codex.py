@@ -27,7 +27,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..pii import scrub_path
-from . import Adapted, RawPrompt, RawTurnEnd, coerce_dict, coerce_str
+from . import Adapted, RawPrompt, RawTurnEnd, coerce_dict, coerce_str, project_from_cwd
 
 __all__ = ["parse", "TURN_COMPLETE", "PROMPT_EVENT", "TURN_END_EVENT"]
 
@@ -91,13 +91,6 @@ def _metadata(data: dict[str, Any]) -> dict[str, Any]:
     return metadata
 
 
-def _project(cwd: str | None) -> str | None:
-    if not cwd:
-        return None
-    parts = [p for p in cwd.replace("\\", "/").split("/") if p]
-    return parts[-1] if parts else None
-
-
 def parse(payload: Any) -> Adapted:
     data = coerce_dict(payload)
     session_id = _first(data, _SESSION_KEYS)
@@ -120,7 +113,7 @@ def parse(payload: Any) -> Adapted:
             prompt=prompt,
             session_id=session_id,
             cwd=cwd,
-            project=_project(cwd),
+            project=project_from_cwd(cwd),
             metadata=metadata,
             ts=ts,
         )
@@ -147,7 +140,7 @@ def parse(payload: Any) -> Adapted:
             prompt=prompt,
             session_id=session_id,
             cwd=cwd,
-            project=_project(cwd),
+            project=project_from_cwd(cwd),
             metadata=metadata,
             ts=ts,
             turn_end_ts=turn_complete_ts,
@@ -161,7 +154,7 @@ def parse(payload: Any) -> Adapted:
         prompt=prompt,
         session_id=session_id,
         cwd=cwd,
-        project=_project(cwd),
+        project=project_from_cwd(cwd),
         metadata=metadata,
         ts=ts,
     )

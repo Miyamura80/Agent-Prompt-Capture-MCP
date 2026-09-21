@@ -1,4 +1,8 @@
-/* Options page. Classic script; no inline handlers (MV3 CSP). */
+/* Options page. ES module (no inline handlers: MV3 CSP). It imports the same
+   loopback rule the service worker enforces, so what the UI accepts and what
+   the worker is willing to POST to cannot drift apart. */
+import { serverUrlProblem } from './lib/limits.js';
+
 (function () {
   'use strict';
 
@@ -56,15 +60,12 @@
 
   function save() {
     var serverUrl = $('serverUrl').value.trim().replace(/\/+$/, '') || SYNC_DEFAULTS.serverUrl;
-    var parsed;
-    try {
-      parsed = new URL(serverUrl);
-    } catch (err) {
-      setStatus('That server URL is not a valid URL.', 'err');
-      return;
-    }
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      setStatus('The server URL must be http: or https:.', 'err');
+    // `apc serve` binds loopback and the manifest only grants http://127.0.0.1
+    // and http://localhost: anything else saves a configuration the worker will
+    // refuse to use.
+    var problem = serverUrlProblem(serverUrl);
+    if (problem) {
+      setStatus(problem, 'err');
       return;
     }
 

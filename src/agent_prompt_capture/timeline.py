@@ -24,6 +24,7 @@ __all__ = [
     "ActivitySession",
     "build_activity_sessions",
     "count_context_switches",
+    "session_key",
     "time_summary",
     "activity_timeline",
     "daily_digest",
@@ -43,6 +44,7 @@ MAX_TIMELINE_BUCKETS = 5000
 MAX_SLICE_STEPS = 10_000
 
 NO_PROJECT = "(none)"
+NO_SESSION = "(none)"
 
 WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 
@@ -163,8 +165,11 @@ def build_activity_sessions(
 ) -> list[ActivitySession]:
     """Split a stream of prompts into activity sessions.
 
-    ``group_by`` of ``"project"``/``"source"`` groups by ``(source, project)`` first,
-    ``"session"`` groups by ``session_id``, anything else walks the whole stream.
+    ``group_by`` of ``"project"`` groups by ``(source, project)``, ``"source"`` by the
+    source alone (splitting a source's stream per project would charge every project
+    its own tail and lose the time between two projects' prompts), ``"session"`` by
+    ``(source, session_id)`` because two agents can hand out the same session id.
+    Anything else walks the whole stream.
     """
     ordered = _sorted(records)
     if not ordered:
@@ -172,14 +177,18 @@ def build_activity_sessions(
 
     gap = timedelta(minutes=max(idle_gap_minutes, 0.0))
 
-    if group_by in ("project", "source"):
+    if group_by == "project":
 
         def bucket(rec: PromptRecord) -> tuple[Any, ...]:
             return (rec.source.value, rec.project or NO_PROJECT)
+    elif group_by == "source":
+
+        def bucket(rec: PromptRecord) -> tuple[Any, ...]:
+            return (rec.source.value,)
     elif group_by == "session":
 
         def bucket(rec: PromptRecord) -> tuple[Any, ...]:
-            return (rec.session_id or "(none)",)
+            return (rec.source.value, rec.session_id or NO_SESSION)
     else:
 
         def bucket(rec: PromptRecord) -> tuple[Any, ...]:
@@ -222,8 +231,14 @@ def _session_key(group_by: str | None, group_key: tuple[Any, ...], rec: PromptRe
     if group_by == "source":
         return rec.source.value
     if group_by == "session":
-        return str(group_key[0])
+        # Session ids are only unique per agent, so the key carries the source too.
+        return session_key(rec.source.value, rec.session_id)
     return "all"
+
+
+def session_key(source: str, session_id: str | None) -> str:
+    """``"<source>:<session_id>"`` - a session id that cannot collide across agents."""
+    return f"{source}:{session_id or NO_SESSION}"
 
 
 def count_context_switches(sessions: Sequence[ActivitySession]) -> int:
@@ -475,7 +490,9 @@ def activity_timeline(
     locals_: list[datetime] = [local_start]
     cursor = local_start
     truncated = False
-    while edges[-1] < end_dt:
+    # ``<=``, not ``<``: ``until`` is inclusive in the store, so a prompt landing exactly
+    # on the last edge needs a bucket to fall into rather than being silently dropped.
+    while edges[-1] <= end_dt:
         if len(edges) > MAX_TIMELINE_BUCKETS:
             truncated = True
             break
@@ -564,8 +581,11 @@ def daily_digest(
     # so stop one millisecond short of the next midnight instead of counting it twice.
     start_local = datetime(day.year, day.month, day.day)  # noqa: DTZ001 - naive local
     end_local = start_local + timedelta(days=1)
-    low = to_iso(from_local(start_local))
-    high = to_iso(from_local(end_local) - timedelta(milliseconds=1))
+    day_start = from_local(start_local)
+    day_end = from_local(end_local)
+    window = (day_start, day_end)
+    low = to_iso(day_start)
+    high = to_iso(day_end - timedelta(milliseconds=1))
 
     records = _fetch(store, low, high)
     sessions = build_activity_sessions(
@@ -588,22 +608,27 @@ def daily_digest(
                 "project": session.project,
                 "source": session.source,
                 "start": to_iso(session.start),
-                "end": to_iso(session.end),
+                # A turn that runs past local midnight belongs to the next day from
+                # there on: clip it, or the digest reports (and credits) time outside
+                # the day it claims to describe.
+                "end": to_iso(min(session.end, day_end)),
                 "prompt_count": session.prompt_count,
-                "active_minutes": session.active_minutes,
+                "active_minutes": round(_overlap_minutes(session.interval, window), 2),
                 "sample_prompts": samples,
             }
         )
 
     starts = [parse_dt(r.ts) for r in records]
     starts = [s for s in starts if s is not None]
-    ends = [e for e in (_event_end(r) for r in records) if e is not None]
+    ends = [min(e, day_end) for e in (_event_end(r) for r in records) if e is not None]
 
     return {
         "date": day.isoformat(),
         "first_activity": to_iso(min(starts)) if starts else None,
         "last_activity": to_iso(max(ends)) if ends else None,
-        "active_minutes": round(sum(s.active_minutes for s in global_sessions), 2),
+        "active_minutes": round(
+            sum(_overlap_minutes(s.interval, window) for s in global_sessions), 2
+        ),
         "prompt_count": len(records),
         "sessions": session_dicts,
         "context_switches": count_context_switches(global_sessions),

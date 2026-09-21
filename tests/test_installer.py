@@ -9,6 +9,7 @@ import pytest
 
 from agent_prompt_capture.installer import (
     CLAUDE_HOOK_EVENTS,
+    CODEX_DEFAULT_TIMEOUT,
     CODEX_HOOK_COMMAND,
     CODEX_HOOK_EVENTS,
     HOOK_COMMAND,
@@ -17,6 +18,7 @@ from agent_prompt_capture.installer import (
     ConfigFormatError,
     claude_settings_path,
     codex_config_path,
+    codex_expected_trust,
     codex_hook_state_key,
     codex_hook_trust_hash,
     codex_hooks_path,
@@ -749,3 +751,143 @@ def test_opencode_template_matches_the_packaged_plugin():
         return re.sub(r"\s+", " ", text[text.index("const COMMAND") :]).strip()
 
     assert body(OPENCODE_PLUGIN_SOURCE) == body(packaged.read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# review regressions (cubic)
+# ---------------------------------------------------------------------------
+
+
+def test_codex_install_normalizes_a_handler_that_has_no_timeout():
+    """Codex would hash such a handler with its own 600 s default, so the hook never ran."""
+    path = codex_hooks_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    event: [{"hooks": [{"type": "command", "command": CODEX_HOOK_COMMAND}]}]
+                    for event in CODEX_HOOK_EVENTS
+                }
+            }
+        )
+    )
+    install("codex")
+
+    handlers = [
+        hook
+        for event in CODEX_HOOK_EVENTS
+        for matcher in json.loads(path.read_text())["hooks"][event]
+        for hook in matcher["hooks"]
+    ]
+    assert handlers and all(h["timeout"] == HOOK_TIMEOUT for h in handlers)
+
+    # ... and the trust entry hashes exactly what is now on disk.
+    state = tomllib.loads(codex_config_path().read_text())["hooks"]["state"]
+    key = codex_hook_state_key(path, "stop")
+    assert state[key]["trusted_hash"] == codex_hook_trust_hash(
+        "stop", CODEX_HOOK_COMMAND, HOOK_TIMEOUT
+    )
+
+
+def test_codex_expected_trust_uses_codex_default_timeout_when_absent():
+    """Hash what Codex hashes: a missing timeout normalizes to 600, not to ours."""
+    path = codex_hooks_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": CODEX_HOOK_COMMAND}]}]}}
+        )
+    )
+    entries = codex_expected_trust(path)
+    assert entries[codex_hook_state_key(path, "stop")] == codex_hook_trust_hash(
+        "stop", CODEX_HOOK_COMMAND, CODEX_DEFAULT_TIMEOUT
+    )
+
+
+def test_codex_legacy_leaves_a_foreign_notify_that_merely_starts_with_apc():
+    path = codex_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = 'notify = ["apc", "wrap", "--my-own-thing"]\n'
+    path.write_text(original)
+    message = install("codex", legacy=True)
+    assert path.read_text() == original
+    assert "already sets notify" in message
+
+
+def test_codex_uninstall_leaves_a_foreign_notify_that_starts_with_apc():
+    path = codex_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = 'notify = ["apc", "wrap", "--my-own-thing"]\n'
+    path.write_text(original)
+    message = uninstall("codex")
+    assert "no apc notify" in message
+    assert path.read_text() == original
+
+
+def test_codex_legacy_still_recognizes_our_own_notify_line():
+    path = codex_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("notify = ['apc', 'capture', 'codex']  # installed by apc\n")
+    install("codex", legacy=True)
+    assert path.read_text().strip() == 'notify = ["apc", "capture", "codex"]'
+    assert "no apc notify" not in uninstall("codex")
+
+
+def test_a_symlinked_temp_path_is_not_followed(tmp_path, monkeypatch):
+    """A pre-created `<config>.apc-tmp` symlink must not be written through."""
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    path = claude_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("PRECIOUS\n")
+    (path.parent / (path.name + ".apc-tmp")).symlink_to(victim)
+
+    install("claude-code")
+
+    assert victim.read_text() == "PRECIOUS\n"
+    assert HOOK_COMMAND in path.read_text()
+
+
+def test_codex_install_writes_no_hooks_when_the_config_is_malformed():
+    """A hooks.json Codex will never be told to trust is worse than no install."""
+    config = codex_config_path()
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('model = "unterminated\nnope\n')
+    with pytest.raises(ConfigFormatError, match="not valid TOML"):
+        install("codex")
+    assert not codex_hooks_path().exists()
+
+
+def test_codex_install_rolls_hooks_json_back_when_trust_fails():
+    config = codex_config_path()
+    config.parent.mkdir(parents=True, exist_ok=True)
+    key = codex_hook_state_key(codex_hooks_path(), "stop")
+    config.write_text(f'hooks.state."{key}".trusted_hash = "sha256:stale"\n')
+
+    hooks = codex_hooks_path()
+    # Nothing registered for Stop, so our Stop hook lands on the stale key above.
+    original = json.dumps({"hooks": {"UserPromptSubmit": [{"hooks": [{"command": "keep"}]}]}})
+    hooks.write_text(original)
+
+    with pytest.raises(ConfigFormatError, match="refusing to write"):
+        install("codex")
+    assert hooks.read_text() == original
+
+
+def test_codex_dry_run_plans_the_normalized_timeout():
+    """The dry run must predict the hash the real install will write, not today's."""
+    path = codex_hooks_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": CODEX_HOOK_COMMAND}]}]}}
+        )
+    )
+    assert "would trust 2 codex hook(s)" in install("codex", dry_run=True)
+
+    install("codex")
+    state = tomllib.loads(codex_config_path().read_text())["hooks"]["state"]
+    assert state[codex_hook_state_key(path, "stop")]["trusted_hash"] == codex_hook_trust_hash(
+        "stop", CODEX_HOOK_COMMAND, HOOK_TIMEOUT
+    )

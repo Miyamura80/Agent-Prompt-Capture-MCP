@@ -405,10 +405,23 @@ well under 1 second (import cost matters: lazy-import the mcp SDK and anything h
   `http://localhost/*`.
 * Options (chrome.storage.sync): `serverUrl` (default `http://127.0.0.1:47821`), `token`,
   `allowedAccounts` (list of emails), per-source enable toggles.
-* Account detection (cached per tab for 10 minutes, refreshed on navigation):
-  * claude.ai: try the account/organization API endpoints the app itself calls with
-    `credentials: "include"`; fall back to reading the account menu in the DOM. See research doc.
-  * chatgpt.com: `GET /api/auth/session` with `credentials: "include"` -> `user.email`.
+* `serverUrl` must be `http://127.0.0.1` or `http://localhost` - the two hosts in
+  `host_permissions`, and the only ones `apc serve` binds without `--allow-remote`. The
+  service worker checks this before every `fetch` (not only in the options UI): a synced
+  or tampered setting must not be able to POST prompts, accounts or the token anywhere
+  else, and such a capture is refused rather than queued.
+* Account detection (cached per tab for 10 minutes, refreshed on navigation; only
+  successful detections are cached, and the cache lives in the content script's own
+  memory so one tab cannot read another tab's identity):
+  * claude.ai: `GET /api/auth/current_account`, then `GET /api/account`, with
+    `credentials: "include"`, reading only a **current-user** field
+    (`email_address`/`email` on the payload root or its `account`/`current_account`/
+    `user`/`profile` object); fall back to reading the account menu in the DOM.
+    Roster endpoints such as `/api/organizations` must not be used: another member's
+    address that happens to be allowlisted would file this user's prompts under it.
+  * chatgpt.com: `GET /api/auth/session` with `credentials: "include"` -> `user.email`
+    and nothing else.
+  * Any other shape means "unknown account", which means no capture.
 * Capture trigger: intercept the composer submit (Enter without Shift, or click on the send
   button) and read the composer text **before** the app clears it. Never modify the page's
   behaviour. Never capture if account is unknown or not allowlisted (the server enforces
@@ -417,8 +430,19 @@ well under 1 second (import cost matters: lazy-import the mcp SDK and anything h
   `chatgpt.com/codex*` -> `codex_cloud`; other `chatgpt.com` -> `chatgpt_web`.
 * Extension applies a light pre-scrub (emails, obvious API keys) before sending, as defence
   in depth; the server does the full scrub.
-* Background service worker queues failed POSTs in `chrome.storage.local` (max 500) and
-  retries with backoff; popup shows listener status and last-24h capture count.
+* The pre-scrub's markers are flat (`[EMAIL]`, `[API_KEY]`) and deliberately not in the
+  server's numbered `[CATEGORY_N]` form: the server cannot renumber or count a value the
+  browser already replaced, so client-scrubbed categories never appear in `pii_findings`,
+  and a numbered client marker could collide with a server placeholder for a different
+  value in the same record.
+* The worker caps the prompt so the *serialized* body stays under the listener's 1 MiB
+  limit (UTF-8 bytes, not characters), and sets `truncated: true` when it cuts.
+* Background service worker queues failed POSTs in `chrome.storage.local` (max 500 items
+  and 4 MiB of serialized JSON, oldest dropped first, quota errors handled) and retries
+  with backoff. All queue read-modify-writes are serialized behind one lock. Queued items
+  are re-validated against the current source/allowlist settings before a retry and
+  dropped if they no longer pass. Popup shows listener status and last-24h capture count;
+  only `202 {"stored": true}` counts towards it, while any 2xx dequeues the item.
 
 ## Quality bar
 

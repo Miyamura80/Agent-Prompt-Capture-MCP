@@ -18,9 +18,12 @@ from dataclasses import dataclass, field
 
 __all__ = ["ScrubResult", "scrub", "scrub_path", "CATEGORIES", "luhn_ok", "MAX_SCRUB_CHARS"]
 
-#: Prompts longer than this are truncated before scrubbing. A 200k-character paste is
-#: already pathological, and the span machinery is O(patterns x text).
-MAX_SCRUB_CHARS = 200_000
+#: Hard upper bound on what is handed to :func:`scrub`. It matches the HTTP listener's
+#: 1 MiB body limit, so a payload that arrived over the wire is scrubbed whole; only a
+#: pathological local paste is cut, and the span machinery is O(patterns x text).
+#: It is deliberately larger than what callers store (``ingest.MAX_PROMPT_CHARS``), so a
+#: secret straddling the stored cap is still recognised and replaced before truncation.
+MAX_SCRUB_CHARS = 1_048_576
 
 _log = logging.getLogger("agent_prompt_capture")
 
@@ -203,16 +206,19 @@ API_KEY_RES: tuple[tuple[re.Pattern[str], int], ...] = (
     (re.compile(r"\bnpm_[A-Za-z0-9]{30,}"), 0),
     (re.compile(r"\bpypi-[A-Za-z0-9_-]{16,}"), 0),
     (re.compile(r"\bhf_[A-Za-z0-9]{20,}"), 0),
-    (re.compile(r"\bBearer\s+([A-Za-z0-9._~+/=-]{12,})"), 1),
+    # ``bearer``/``BEARER`` are as valid as ``Bearer`` in an Authorization header.
+    (re.compile(r"(?i)\bBearer\s+([A-Za-z0-9._~+/=-]{12,})"), 1),
     (
-        # ``password = "x"`` and friends. The key name may carry a prefix
-        # (``DB_PASSWORD``, ``STRIPE_SECRET``, ``X-Auth-Token``), which the old
-        # ``\b`` anchor silently missed.
+        # ``password = "x"`` and friends. The key name may carry any number of
+        # prefix *and* suffix segments (``DB_PASSWORD``, ``STRIPE_SECRET``,
+        # ``X-Auth-Token``, ``AWS_SECRET_ACCESS_KEY``), and may be quoted as a JSON
+        # key (``"api_key": "..."``), so the quote before the separator is optional.
         re.compile(
-            r"(?i)(?<![A-Za-z0-9])[A-Za-z0-9]*[_.-]?"
+            r"(?i)(?<![A-Za-z0-9])(?:[A-Za-z0-9]+[_.-])*"
             r"(?:api[_-]?key|apikey|access[_-]?token|auth[_-]?token|refresh[_-]?token"
             r"|client[_-]?secret|secret|token|password|passwd|passphrase)"
-            r"\b\s*[:=]\s*[\"']?([^\s\"',;)]{6,})[\"']?"
+            r"(?:[_.-][A-Za-z0-9]+)*"
+            r"\b[\"']?\s*[:=]\s*[\"']?([^\s\"',;)]{6,})[\"']?"
         ),
         1,
     ),
@@ -234,7 +240,14 @@ UUID_RE = re.compile(
 #: Categories that a UUID must never be mistaken for.
 _UUID_EXEMPT: frozenset[str] = frozenset({"credit_card", "phone", "ssn", "iban"})
 
-IBAN_RE = re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b")
+#: An IBAN, written solid (``GB33BUKB20201555555555``) or in the printed form with
+#: grouping spaces (``GB33 BUKB 2020 1555 5555 55``). ``_iban_ok`` (mod-97) is what
+#: keeps the grouped alternative from swallowing ordinary uppercase prose.
+IBAN_RE = re.compile(
+    r"\b[A-Z]{2}\d{2}"
+    r"(?:[A-Z0-9]{11,30}|(?:[ ][A-Z0-9]{4})+(?:[ ][A-Z0-9]{1,4})?)"
+    r"\b"
+)
 
 SSN_RE = re.compile(r"\b(?!000|666|9\d\d)\d{3}[- ](?!00)\d{2}[- ](?!0000)\d{4}\b")
 

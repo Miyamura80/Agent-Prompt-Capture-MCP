@@ -34,6 +34,7 @@ POSITIVES: list[tuple[str, str, str, str]] = [
     ("credit card dashes", "card 5555-5555-5555-4444 ok", "credit_card", "5555-5555"),
     ("iban gb", "pay to GB82WEST12345698765432 today", "iban", "GB82WEST12345698765432"),
     ("iban de", "pay to DE89370400440532013000 today", "iban", "DE89370400440532013000"),
+    ("iban grouped", "pay to GB33 BUKB 2020 1555 5555 55 today", "iban", "BUKB 2020"),
     ("api key openai", "key sk-abc123456789012345678901234567890 set", "api_key", "sk-abc1234"),
     ("api key anthropic", "key sk-ant-api03-AAAAbbbbCCCCddddEEEE1234 set", "api_key", "sk-ant-"),
     ("api key proj", "key sk-proj-AAAAbbbbCCCCddddEEEE1234 set", "api_key", "sk-proj-"),
@@ -43,6 +44,42 @@ POSITIVES: list[tuple[str, str, str, str]] = [
     ("api key gitlab", "pat glpat-AAAAbbbbCCCCddddEEEE ok", "api_key", "glpat-"),
     ("api key slack", "tok xoxb-123456789012-abcdefghij ok", "api_key", "xoxb-"),
     ("api key aws", "id AKIAIOSFODNN7EXAMPLE used", "api_key", "AKIAIOSFODNN7EXAMPLE"),
+    (
+        "bearer lowercase scheme",
+        "authorization: bearer abcdefghijklmnop12345",
+        "api_key",
+        "abcdefghijklmnop12345",
+    ),
+    (
+        "bearer uppercase scheme",
+        "AUTHORIZATION: BEARER abcdefghijklmnop12345",
+        "api_key",
+        "abcdefghijklmnop12345",
+    ),
+    (
+        "api key as a json key",
+        '{"api_key": "supersecretvalue123", "n": 1}',
+        "api_key",
+        "supersecretvalue123",
+    ),
+    (
+        "api key as a quoted camel json key",
+        "{'apiKey': 'supersecretvalue123'}",
+        "api_key",
+        "supersecretvalue123",
+    ),
+    (
+        "multi segment env credential",
+        "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+        "api_key",
+        "wJalrXUtnFEMI",
+    ),
+    (
+        "multi segment prefix and suffix",
+        "MY_APP_API_KEY_V2=abcdef123456",
+        "api_key",
+        "abcdef123456",
+    ),
     ("api key google", "key AIzaSyB1234567890abcdefghijklmnopqrstuv used", "api_key", "AIzaSy"),
     ("api key npm", "tok npm_abcdefghijklmnopqrstuvwxyz0123456789 ok", "api_key", "npm_"),
     ("api key pypi", "tok pypi-AgEIcHlwaS5vcmc1234567 ok", "api_key", "pypi-"),
@@ -481,3 +518,10 @@ def test_long_input_is_not_pathological():
     result = scrub(text)
     assert time.monotonic() - started < 5.0
     assert "[EMAIL_1]" in result.text
+
+
+def test_a_grouped_iban_does_not_swallow_the_prose_after_it():
+    """The mod-97 check is what keeps the grouping-space alternative honest."""
+    result = scrub("send it to ES91 2100 0418 4502 0005 1332 TODAY PLEASE")
+    assert result.findings == {"iban": 1}
+    assert result.text == "send it to [IBAN_1] TODAY PLEASE"

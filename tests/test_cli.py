@@ -154,7 +154,7 @@ def test_capture_ignores_a_non_json_argv_argument(apc_home, stdin):
 
 
 def test_capture_opencode_turn_end(apc_home, stdin):
-    stdin(json.dumps({"prompt": "do a thing", "session_id": "ses_1"}))
+    stdin(json.dumps({"prompt": "do a thing", "session_id": "ses_1", "ts": "2026-09-19T20:00:00Z"}))
     main(["capture", "opencode"])
     stdin(json.dumps({"event": "turn_end", "session_id": "ses_1", "ts": "2026-09-19T21:00:00Z"}))
     main(["capture", "opencode"])

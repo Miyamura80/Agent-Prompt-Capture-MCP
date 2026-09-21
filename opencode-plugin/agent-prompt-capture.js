@@ -2,70 +2,104 @@
 //
 // Pipes every submitted user message to `apc capture opencode` as JSON on stdin, and
 // every `session.idle` transition as a turn-end event. The child is spawned detached and
-// never awaited: `chat.message` is awaited by the session loop, so any work done here is
-// latency the user feels. Everything is wrapped in try/catch — capture is best effort and
-// must never slow down or break OpenCode.
+// never awaited from `chat.message`: that hook is awaited by the session loop, so any
+// work done there is latency the user feels. Everything is wrapped in try/catch —
+// capture is best effort and must never slow down or break OpenCode.
+//
+// Per session the children are *ordered*, though: `session.idle` can arrive while the
+// prompt's child is still starting up, and a turn_end that runs first finds no row to
+// stamp and is lost. Each session gets a promise chain, so its turn_end child is only
+// spawned once the prompt child has exited.
 //
 // Install with `apc install opencode` (copies this file to
 // ~/.config/opencode/plugin/agent-prompt-capture.js).
 
 const COMMAND = "apc";
 const ARGS = ["capture", "opencode"];
+// A capture writes one row; if the child has not exited by then it never will, and the
+// session's next event must not wait on it forever.
+const SPAWN_TIMEOUT_MS = 10000;
 
+/**
+ * Spawn `apc capture opencode`, feed it `json`, and resolve when the child has exited
+ * (or could not be started at all). The promise never rejects.
+ */
 function spawnDetached(json) {
-  // Bun first (OpenCode's server runs on Bun), node:child_process otherwise.
-  let spawned = null;
-  try {
-    if (globalThis.Bun && typeof globalThis.Bun.spawn === "function") {
-      // Bun.spawn throws synchronously when `apc` is not on PATH; that is the only
-      // reason to fall through to node. A failure AFTER the spawn must not retry,
-      // or one prompt is captured twice.
-      spawned = globalThis.Bun.spawn([COMMAND, ...ARGS], {
-        stdin: "pipe",
-        stdout: "ignore",
-        stderr: "ignore",
-      });
-    }
-  } catch (_) {
-    spawned = null; // fall through to node
-  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
 
-  if (spawned) {
+    function done() {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      resolve();
+    }
+
+    // The timer and the child stay referenced on purpose: a caller that awaits this
+    // promise (the per-session chain, or a short-lived host such as the e2e driver)
+    // must not have its event loop drain before the child exits. done() clears the
+    // timer, so a healthy child never holds the host open past its own runtime.
+    timer = setTimeout(done, SPAWN_TIMEOUT_MS);
+
+    // Bun first (OpenCode's server runs on Bun), node:child_process otherwise.
+    let spawned = null;
     try {
-      spawned.stdin.write(json);
-      spawned.stdin.end();
-      if (typeof spawned.unref === "function") spawned.unref();
-    } catch (_) {
-      // the child died before it read us; nothing to salvage, never retry
-    }
-    return;
-  }
-
-  import("node:child_process")
-    .then(({ spawn }) => {
-      const child = spawn(COMMAND, ARGS, {
-        stdio: ["pipe", "ignore", "ignore"],
-        detached: true,
-      });
-      // A missing `apc` surfaces as an async "error" event, never a throw.
-      child.on("error", () => {});
-      if (child.stdin) {
-        child.stdin.on("error", () => {});
-        // end() both writes and closes the pipe: that close, not unref(), is what
-        // lets the parent's event loop drain. unref() is belt and braces.
-        child.stdin.end(json);
-        if (typeof child.stdin.unref === "function") child.stdin.unref();
+      if (globalThis.Bun && typeof globalThis.Bun.spawn === "function") {
+        // Bun.spawn throws synchronously when `apc` is not on PATH; that is the only
+        // reason to fall through to node. A failure AFTER the spawn must not retry,
+        // or one prompt is captured twice.
+        spawned = globalThis.Bun.spawn([COMMAND, ...ARGS], {
+          stdin: "pipe",
+          stdout: "ignore",
+          stderr: "ignore",
+        });
       }
-      child.unref();
-    })
-    .catch(() => {});
+    } catch (_) {
+      spawned = null; // fall through to node
+    }
+
+    if (spawned) {
+      try {
+        spawned.stdin.write(json);
+        spawned.stdin.end();
+      } catch (_) {
+        // the child died before it read us; nothing to salvage, never retry
+        done();
+        return;
+      }
+      if (spawned.exited && typeof spawned.exited.then === "function") {
+        spawned.exited.then(done, done);
+      } else {
+        done();
+      }
+      return;
+    }
+
+    import("node:child_process")
+      .then(({ spawn }) => {
+        const child = spawn(COMMAND, ARGS, {
+          stdio: ["pipe", "ignore", "ignore"],
+          detached: true,
+        });
+        // A missing `apc` surfaces as an async "error" event, never a throw.
+        child.on("error", () => done());
+        child.on("close", () => done());
+        if (child.stdin) {
+          child.stdin.on("error", () => {});
+          // end() both writes and closes the pipe; "close" fires once the child exits.
+          child.stdin.end(json);
+        }
+      })
+      .catch(() => done());
+  });
 }
 
 function send(payload) {
   try {
-    spawnDetached(JSON.stringify(payload));
+    return spawnDetached(JSON.stringify(payload));
   } catch (_) {
-    // never propagate
+    return Promise.resolve(); // never propagate
   }
 }
 
@@ -115,6 +149,30 @@ function rememberSession(sessionID) {
   OPEN_SESSIONS.add(sessionID);
 }
 
+// One promise chain per session: the prompt's child must have exited before the
+// turn_end child starts, or `apc capture` finds no open turn to stamp. Different
+// sessions never wait on each other.
+const SESSION_CHAINS = new Map();
+
+function enqueueForSession(sessionID, payload) {
+  const key = sessionID || "";
+  const previous = SESSION_CHAINS.get(key);
+  const next = (previous || Promise.resolve()).then(
+    () => send(payload),
+    () => send(payload),
+  );
+  if (!SESSION_CHAINS.has(key) && SESSION_CHAINS.size >= MAX_OPEN_SESSIONS) {
+    // Maps iterate in insertion order, so this drops the oldest.
+    SESSION_CHAINS.delete(SESSION_CHAINS.keys().next().value);
+  }
+  SESSION_CHAINS.set(key, next);
+  const forget = () => {
+    if (SESSION_CHAINS.get(key) === next) SESSION_CHAINS.delete(key);
+  };
+  next.then(forget, forget);
+  return next;
+}
+
 export const AgentPromptCapture = async ({ project, client, $, directory, worktree }) => ({
   "chat.message": async (input, output) => {
     try {
@@ -131,7 +189,8 @@ export const AgentPromptCapture = async ({ project, client, $, directory, worktr
       const sessionID = (input && input.sessionID) || message.sessionID || null;
       rememberSession(sessionID);
 
-      send({
+      // Deliberately not awaited: the chain only orders this session's children.
+      enqueueForSession(sessionID, {
         session_id: sessionID,
         cwd: directory || null,
         project: (project && project.id) || basename(worktree) || null,
@@ -154,7 +213,9 @@ export const AgentPromptCapture = async ({ project, client, $, directory, worktr
       if (!sessionID) return;
       if (!OPEN_SESSIONS.has(sessionID)) return; // no open turn of ours: nothing to end
       OPEN_SESSIONS.delete(sessionID);
-      send({
+      // `ts` is stamped now, not when the child finally runs, so a queued turn end
+      // still records when the session actually went idle.
+      await enqueueForSession(sessionID, {
         event: "turn_end",
         session_id: sessionID,
         ts: new Date().toISOString(),

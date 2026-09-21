@@ -5,7 +5,20 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime, timedelta
 
-__all__ = ["parse_time", "parse_duration", "to_iso", "parse_dt", "RELATIVE_RE"]
+__all__ = [
+    "parse_time",
+    "parse_duration",
+    "to_iso",
+    "parse_dt",
+    "RELATIVE_RE",
+    "MAX_FUTURE_SKEW_SECONDS",
+]
+
+#: How far ahead of our own clock a client-supplied timestamp may be before we
+#: distrust it. Browser and hook payloads carry the *client's* clock; a past value is
+#: legitimate (queued POSTs are replayed), a future one is skew and poisons every
+#: time-window query as well as the 5 s dedup window.
+MAX_FUTURE_SKEW_SECONDS = 300.0
 
 RELATIVE_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*(m|h|d|w|mo|y)$", re.IGNORECASE)
 
@@ -26,7 +39,12 @@ def parse_duration(value: str) -> timedelta:
         raise ValueError(f"not a relative duration: {value!r}")
     amount = float(match.group(1))
     unit = match.group(2).lower()
-    return timedelta(seconds=amount * _UNIT_SECONDS[unit])
+    try:
+        return timedelta(seconds=amount * _UNIT_SECONDS[unit])
+    except (OverflowError, ValueError) as exc:
+        # ``float`` saturates to inf and ``timedelta`` caps at ~999999999 days: an
+        # oversized bound is a bad value, not an internal error.
+        raise ValueError(f"duration out of range: {value!r}") from exc
 
 
 def to_iso(dt: datetime) -> str:
@@ -58,7 +76,11 @@ def parse_time(value: str | datetime | None, *, now: datetime | None = None) -> 
         return to_iso(reference)
 
     if RELATIVE_RE.match(text):
-        return to_iso(reference - parse_duration(text))
+        delta = parse_duration(text)
+        try:
+            return to_iso(reference - delta)
+        except OverflowError as exc:  # a duration that walks off the datetime range
+            raise ValueError(f"time out of range: {value!r}") from exc
 
     candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
     try:

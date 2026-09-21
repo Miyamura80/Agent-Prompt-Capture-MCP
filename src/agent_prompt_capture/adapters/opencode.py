@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import Adapted, RawPrompt, RawTurnEnd, coerce_dict, coerce_str
+from . import Adapted, RawPrompt, RawTurnEnd, coerce_dict, coerce_str, project_from_cwd
 
 __all__ = ["parse"]
 
@@ -45,7 +45,7 @@ def parse(payload: Any) -> Adapted:
         prompt=prompt,
         session_id=coerce_str(data.get("session_id")) or coerce_str(data.get("sessionID")),
         cwd=cwd,
-        project=coerce_str(data.get("project")) or _project(cwd),
+        project=coerce_str(data.get("project")) or project_from_cwd(cwd),
         metadata=metadata,
         ts=coerce_str(data.get("ts")),
     )
@@ -62,10 +62,3 @@ def _attachment_count(value: Any) -> int | None:
     if isinstance(value, str) and value.strip().isdigit():
         return int(value.strip())
     return None
-
-
-def _project(cwd: str | None) -> str | None:
-    if not cwd:
-        return None
-    parts = [p for p in cwd.replace("\\", "/").split("/") if p]
-    return parts[-1] if parts else None

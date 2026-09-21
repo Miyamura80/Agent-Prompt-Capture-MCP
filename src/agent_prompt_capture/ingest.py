@@ -15,7 +15,7 @@ from .config import Config, get_logger
 from .models import BROWSER_SOURCES, PromptRecord, Source, new_id, utc_now_iso
 from .pii import MAX_SCRUB_CHARS, scrub, scrub_path
 from .store import Store
-from .timeutil import parse_dt, parse_time
+from .timeutil import MAX_FUTURE_SKEW_SECONDS, parse_dt, parse_time
 
 __all__ = [
     "ingest",
@@ -26,16 +26,11 @@ __all__ = [
     "MAX_METADATA_CHARS",
 ]
 
-#: Prompts longer than this are truncated before scrubbing; the loss is recorded in
+#: Prompts longer than this are truncated *after* scrubbing; the loss is recorded in
 #: ``metadata.prompt_truncated`` / ``metadata.prompt_original_chars``.
-MAX_PROMPT_CHARS = MAX_SCRUB_CHARS
+MAX_PROMPT_CHARS = 200_000
 #: Individual metadata strings are capped much harder: they are labels, not content.
 MAX_METADATA_CHARS = 4096
-#: How far ahead of our own clock a client-supplied ``ts`` may be before we distrust it.
-#: Browser payloads carry the *browser's* clock; a past ts is legitimate (the extension
-#: queues failed POSTs and replays them), a future one is skew and poisons every
-#: time-window query as well as the 5 s dedup window.
-MAX_FUTURE_SKEW_SECONDS = 300.0
 
 _log = get_logger()
 
@@ -99,23 +94,28 @@ def _resolve_ts(raw_ts: str | None) -> tuple[str, str | None]:
 
 
 def _scrub_metadata(metadata: dict[str, Any], config: Config) -> dict[str, Any]:
-    """Scrub every string leaf of the metadata mapping."""
+    """Scrub every string leaf *and every mapping key* of the metadata mapping."""
+
+    def text(value: str) -> str:
+        return scrub(
+            value[:MAX_METADATA_CHARS],
+            extra_terms=config.extra_terms,
+            extra_patterns=config.extra_patterns,
+            enable_ner=config.enable_ner,
+        ).text
 
     def walk(value: Any) -> Any:
         if isinstance(value, str):
-            return scrub(
-                value[:MAX_METADATA_CHARS],
-                extra_terms=config.extra_terms,
-                extra_patterns=config.extra_patterns,
-                enable_ner=config.enable_ner,
-            ).text
+            return text(value)
         if isinstance(value, dict):
-            return {k: walk(v) for k, v in value.items()}
+            # A key carries PII as readily as a value ({"alice@example.com": 3}), and
+            # nothing may reach SQLite unscrubbed.
+            return {text(str(k)): walk(v) for k, v in value.items()}
         if isinstance(value, list):
             return [walk(v) for v in value]
         return value
 
-    return {str(k): walk(v) for k, v in metadata.items()}
+    return {text(str(k)): walk(v) for k, v in metadata.items()}
 
 
 def ingest(
@@ -141,8 +141,16 @@ def ingest(
         return None
 
     if isinstance(parsed, RawTurnEnd):
-        updated = store.mark_turn_end(src, parsed.session_id, parsed.ts)
-        _log.debug("turn end for %s/%s -> %s", src.value, parsed.session_id, updated)
+        # The prompt rows hold the *scrubbed* session id, so the lookup has to use the
+        # same value or the Stop event closes nothing.
+        session_id = (
+            scrub(parsed.session_id[:MAX_METADATA_CHARS], extra_terms=config.extra_terms).text
+            if parsed.session_id
+            else None
+        )
+        end_ts, _skewed = _resolve_ts(parsed.ts)
+        updated = store.mark_turn_end(src, session_id, end_ts)
+        _log.debug("turn end for %s/%s -> %s", src.value, session_id, updated)
         return None
 
     return _ingest_prompt(src, parsed, config=config, store=store)
@@ -157,13 +165,14 @@ def _ingest_prompt(
 
     account = config.resolve_account(raw.account)
 
-    # A pasted log or a whole file can be arbitrarily large. Cap it *before* scrubbing:
-    # the span machinery is linear in the text per pattern, and nothing downstream
-    # wants a megabyte of prompt. The hash is taken over the same truncated text so
-    # dedup stays consistent with what we store.
+    # A pasted log or a whole file can be arbitrarily large. Scrub first and truncate
+    # the *scrubbed* text: truncating first would cut a secret in half at the cap and
+    # store its prefix raw, because the pattern no longer matches. The scrub input is
+    # still bounded (MAX_SCRUB_CHARS, the listener's own body limit) so the span
+    # machinery stays linear in something finite. The hash is taken over the same raw
+    # text that was scrubbed, so dedup stays consistent.
     original_chars = len(raw.prompt or "")
-    raw_prompt = (raw.prompt or "")[:MAX_PROMPT_CHARS]
-    truncated = original_chars > len(raw_prompt)
+    raw_prompt = (raw.prompt or "")[:MAX_SCRUB_CHARS]
 
     result = scrub(
         raw_prompt,
@@ -171,7 +180,9 @@ def _ingest_prompt(
         extra_patterns=config.extra_patterns,
         enable_ner=config.enable_ner,
     )
-    if not result.text.strip():
+    prompt_text = result.text[:MAX_PROMPT_CHARS]
+    truncated = len(prompt_text) < len(result.text) or original_chars > len(raw_prompt)
+    if not prompt_text.strip():
         return None
 
     session_id = (
@@ -194,7 +205,9 @@ def _ingest_prompt(
     if skewed_ts is not None:
         metadata["client_ts"] = skewed_ts
         metadata["client_clock_skew"] = True
-    turn_end_ts = parse_time(raw.turn_end_ts) if raw.turn_end_ts else None
+    # Same clock policy as ``ts``: an unparseable end must not raise out of a hook and
+    # a future one must not inflate agent time by days.
+    turn_end_ts = _resolve_ts(raw.turn_end_ts)[0] if raw.turn_end_ts else None
     if turn_end_ts is not None and turn_end_ts < ts:
         # A turn cannot end before it started: trust the ordering, not the clock.
         turn_end_ts = ts
@@ -203,13 +216,13 @@ def _ingest_prompt(
         id=new_id(),
         ts=ts,
         source=src,
-        prompt=result.text,
+        prompt=prompt_text,
         prompt_hash=_hash(raw_prompt),
         session_id=session_id,
         account=account,
         cwd=cwd,
         project=project,
-        char_count=len(result.text),
+        char_count=len(prompt_text),
         pii_findings=result.findings,
         metadata=metadata,
         turn_end_ts=turn_end_ts,

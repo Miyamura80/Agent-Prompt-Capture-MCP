@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,10 @@ HOOK_TIMEOUT = 10
 
 CODEX_HOOK_COMMAND = "apc capture codex"
 CODEX_HOOK_EVENTS = ("UserPromptSubmit", "Stop")
+#: What Codex normalizes a handler with no ``timeout`` to, and therefore hashes:
+#: ``timeout_sec.unwrap_or(600)`` in ``discovery.rs::normalize_command_hook``.
+#: See docs/research/hook-specs.md section 2.
+CODEX_DEFAULT_TIMEOUT = 600
 CODEX_HOOKS_DESCRIPTION = "agent-prompt-capture"
 CODEX_NOTIFY = ["apc", "capture", "codex"]
 
@@ -58,70 +63,104 @@ OPENCODE_PLUGIN_SOURCE = r"""// agent-prompt-capture: OpenCode plugin.
 //
 // Pipes every submitted user message to `apc capture opencode` as JSON on stdin, and
 // every `session.idle` transition as a turn-end event. The child is spawned detached and
-// never awaited: `chat.message` is awaited by the session loop, so any work done here is
-// latency the user feels. Everything is wrapped in try/catch — capture is best effort and
-// must never slow down or break OpenCode.
+// never awaited from `chat.message`: that hook is awaited by the session loop, so any
+// work done there is latency the user feels. Everything is wrapped in try/catch —
+// capture is best effort and must never slow down or break OpenCode.
+//
+// Per session the children are *ordered*, though: `session.idle` can arrive while the
+// prompt's child is still starting up, and a turn_end that runs first finds no row to
+// stamp and is lost. Each session gets a promise chain, so its turn_end child is only
+// spawned once the prompt child has exited.
 //
 // Install with `apc install opencode` (copies this file to
 // ~/.config/opencode/plugin/agent-prompt-capture.js).
 
 const COMMAND = "apc";
 const ARGS = ["capture", "opencode"];
+// A capture writes one row; if the child has not exited by then it never will, and the
+// session's next event must not wait on it forever.
+const SPAWN_TIMEOUT_MS = 10000;
 
+/**
+ * Spawn `apc capture opencode`, feed it `json`, and resolve when the child has exited
+ * (or could not be started at all). The promise never rejects.
+ */
 function spawnDetached(json) {
-  // Bun first (OpenCode's server runs on Bun), node:child_process otherwise.
-  let spawned = null;
-  try {
-    if (globalThis.Bun && typeof globalThis.Bun.spawn === "function") {
-      // Bun.spawn throws synchronously when `apc` is not on PATH; that is the only
-      // reason to fall through to node. A failure AFTER the spawn must not retry,
-      // or one prompt is captured twice.
-      spawned = globalThis.Bun.spawn([COMMAND, ...ARGS], {
-        stdin: "pipe",
-        stdout: "ignore",
-        stderr: "ignore",
-      });
-    }
-  } catch (_) {
-    spawned = null; // fall through to node
-  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
 
-  if (spawned) {
+    function done() {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      resolve();
+    }
+
+    // The timer and the child stay referenced on purpose: a caller that awaits this
+    // promise (the per-session chain, or a short-lived host such as the e2e driver)
+    // must not have its event loop drain before the child exits. done() clears the
+    // timer, so a healthy child never holds the host open past its own runtime.
+    timer = setTimeout(done, SPAWN_TIMEOUT_MS);
+
+    // Bun first (OpenCode's server runs on Bun), node:child_process otherwise.
+    let spawned = null;
     try {
-      spawned.stdin.write(json);
-      spawned.stdin.end();
-      if (typeof spawned.unref === "function") spawned.unref();
-    } catch (_) {
-      // the child died before it read us; nothing to salvage, never retry
-    }
-    return;
-  }
-
-  import("node:child_process")
-    .then(({ spawn }) => {
-      const child = spawn(COMMAND, ARGS, {
-        stdio: ["pipe", "ignore", "ignore"],
-        detached: true,
-      });
-      // A missing `apc` surfaces as an async "error" event, never a throw.
-      child.on("error", () => {});
-      if (child.stdin) {
-        child.stdin.on("error", () => {});
-        // end() both writes and closes the pipe: that close, not unref(), is what
-        // lets the parent's event loop drain. unref() is belt and braces.
-        child.stdin.end(json);
-        if (typeof child.stdin.unref === "function") child.stdin.unref();
+      if (globalThis.Bun && typeof globalThis.Bun.spawn === "function") {
+        // Bun.spawn throws synchronously when `apc` is not on PATH; that is the only
+        // reason to fall through to node. A failure AFTER the spawn must not retry,
+        // or one prompt is captured twice.
+        spawned = globalThis.Bun.spawn([COMMAND, ...ARGS], {
+          stdin: "pipe",
+          stdout: "ignore",
+          stderr: "ignore",
+        });
       }
-      child.unref();
-    })
-    .catch(() => {});
+    } catch (_) {
+      spawned = null; // fall through to node
+    }
+
+    if (spawned) {
+      try {
+        spawned.stdin.write(json);
+        spawned.stdin.end();
+      } catch (_) {
+        // the child died before it read us; nothing to salvage, never retry
+        done();
+        return;
+      }
+      if (spawned.exited && typeof spawned.exited.then === "function") {
+        spawned.exited.then(done, done);
+      } else {
+        done();
+      }
+      return;
+    }
+
+    import("node:child_process")
+      .then(({ spawn }) => {
+        const child = spawn(COMMAND, ARGS, {
+          stdio: ["pipe", "ignore", "ignore"],
+          detached: true,
+        });
+        // A missing `apc` surfaces as an async "error" event, never a throw.
+        child.on("error", () => done());
+        child.on("close", () => done());
+        if (child.stdin) {
+          child.stdin.on("error", () => {});
+          // end() both writes and closes the pipe; "close" fires once the child exits.
+          child.stdin.end(json);
+        }
+      })
+      .catch(() => done());
+  });
 }
 
 function send(payload) {
   try {
-    spawnDetached(JSON.stringify(payload));
+    return spawnDetached(JSON.stringify(payload));
   } catch (_) {
-    // never propagate
+    return Promise.resolve(); // never propagate
   }
 }
 
@@ -171,6 +210,30 @@ function rememberSession(sessionID) {
   OPEN_SESSIONS.add(sessionID);
 }
 
+// One promise chain per session: the prompt's child must have exited before the
+// turn_end child starts, or `apc capture` finds no open turn to stamp. Different
+// sessions never wait on each other.
+const SESSION_CHAINS = new Map();
+
+function enqueueForSession(sessionID, payload) {
+  const key = sessionID || "";
+  const previous = SESSION_CHAINS.get(key);
+  const next = (previous || Promise.resolve()).then(
+    () => send(payload),
+    () => send(payload),
+  );
+  if (!SESSION_CHAINS.has(key) && SESSION_CHAINS.size >= MAX_OPEN_SESSIONS) {
+    // Maps iterate in insertion order, so this drops the oldest.
+    SESSION_CHAINS.delete(SESSION_CHAINS.keys().next().value);
+  }
+  SESSION_CHAINS.set(key, next);
+  const forget = () => {
+    if (SESSION_CHAINS.get(key) === next) SESSION_CHAINS.delete(key);
+  };
+  next.then(forget, forget);
+  return next;
+}
+
 export const AgentPromptCapture = async ({ project, client, $, directory, worktree }) => ({
   "chat.message": async (input, output) => {
     try {
@@ -187,7 +250,8 @@ export const AgentPromptCapture = async ({ project, client, $, directory, worktr
       const sessionID = (input && input.sessionID) || message.sessionID || null;
       rememberSession(sessionID);
 
-      send({
+      // Deliberately not awaited: the chain only orders this session's children.
+      enqueueForSession(sessionID, {
         session_id: sessionID,
         cwd: directory || null,
         project: (project && project.id) || basename(worktree) || null,
@@ -210,7 +274,9 @@ export const AgentPromptCapture = async ({ project, client, $, directory, worktr
       if (!sessionID) return;
       if (!OPEN_SESSIONS.has(sessionID)) return; // no open turn of ours: nothing to end
       OPEN_SESSIONS.delete(sessionID);
-      send({
+      // `ts` is stamped now, not when the child finally runs, so a queued turn end
+      // still records when the session actually went idle.
+      await enqueueForSession(sessionID, {
         event: "turn_end",
         session_id: sessionID,
         ts: new Date().toISOString(),
@@ -277,20 +343,26 @@ def _write_atomic(path: Path, text: str) -> None:
     The temp file is created 0600 and only widened to the mode of the file it replaces
     (0644 for a new one): a config file must never be briefly world-readable while it
     is being written, and an existing file's permissions must survive the rename.
+
+    ``mkstemp`` picks the name (and creates it O_EXCL): a fixed ``<name>.apc-tmp`` that
+    somebody has pre-created as a symlink would be followed, and we would write the
+    config - and chmod it - straight through to whatever the link points at.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         mode = path.stat().st_mode & 0o777
     except OSError:
         mode = 0o644
-    tmp = path.with_name(path.name + ".apc-tmp")
-    descriptor = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    descriptor, name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=path.name + ".", suffix=".apc-tmp"
+    )
+    tmp = Path(name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.chmod(tmp, mode)
+        os.chmod(tmp, mode)  # mkstemp already made it 0600
         os.replace(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
@@ -441,15 +513,53 @@ def _uninstall_claude_code() -> str:
 
 _NOTIFY_LINE = re.compile(r"^\s*notify\s*=.*$", re.MULTILINE)
 _SECTION = re.compile(r"^\s*\[", re.MULTILINE)
-_APC_NOTIFY = re.compile(r"^\s*notify\s*=\s*\[\s*[\"']apc[\"']", re.MULTILINE)
+
+#: Only *our* notify line: the complete argv, in order, with nothing after it but
+#: whitespace or a comment. ``notify = ["apc", "wrap", "--mine"]`` merely starts with
+#: "apc" and belongs to whoever wrote it - we neither overwrite nor remove it.
+_APC_NOTIFY = re.compile(
+    r"^[ \t]*notify[ \t]*=[ \t]*\[[ \t]*"
+    + r"[ \t]*,[ \t]*".join("[\"']" + re.escape(arg) + "[\"']" for arg in CODEX_NOTIFY)
+    + r"[ \t]*,?[ \t]*\][ \t]*(?:#[^\n]*)?$",
+    re.MULTILINE,
+)
 
 CODEX_NOTIFY_LINE = 'notify = ["apc", "capture", "codex"]'
+
+
+def _codex_notify_installed(text: str) -> bool:
+    """Is apc's own ``notify`` line (and nobody else's) in this top-level region?"""
+    return _APC_NOTIFY.search(text) is not None
 
 
 def _top_level_region(text: str) -> tuple[int, int]:
     """The byte range of the file before the first ``[section]`` header."""
     match = _SECTION.search(text)
     return (0, match.start() if match else len(text))
+
+
+def _normalize_codex_handlers(matchers: list[Any]) -> bool:
+    """Give every apc handler in ``matchers`` the ``type``/``timeout`` we hash.
+
+    Returns whether anything changed. Only handlers whose command is exactly ours are
+    touched: somebody's ``apc capture codex --their-flag`` wrapper is their business.
+    """
+    changed = False
+    for matcher in matchers:
+        if not isinstance(matcher, dict):
+            continue
+        for handler in matcher.get("hooks") or []:
+            if not isinstance(handler, dict):
+                continue
+            if str(handler.get("command", "")) != CODEX_HOOK_COMMAND:
+                continue
+            if handler.get("timeout") != HOOK_TIMEOUT:
+                handler["timeout"] = HOOK_TIMEOUT
+                changed = True
+            if handler.get("type") != "command":
+                handler["type"] = "command"
+                changed = True
+    return changed
 
 
 def _install_codex_hooks(*, dry_run: bool) -> str:
@@ -461,11 +571,19 @@ def _install_codex_hooks(*, dry_run: bool) -> str:
         hooks = {}
 
     added: list[str] = []
+    normalized = False
     for event in CODEX_HOOK_EVENTS:
         matchers = hooks.get(event)
         if not isinstance(matchers, list):
             matchers = []
         if _has_command(matchers, CODEX_HOOK_COMMAND):
+            # An entry already there (a hand-written one, say) may be missing the
+            # timeout we hash for the trust entry; Codex would normalize it to its own
+            # 600 s default and the hashes would never match, so the hook would never
+            # run. Make the file say what we are about to trust.
+            if _normalize_codex_handlers(matchers):
+                hooks[event] = matchers
+                normalized = True
             continue
         matchers = [
             *matchers,
@@ -490,6 +608,8 @@ def _install_codex_hooks(*, dry_run: bool) -> str:
         return f"[dry-run] would write {path}:\n{rendered}"
     _write_atomic(path, rendered)
     if not added:
+        if normalized:
+            return f"normalized the codex hook timeouts in {path}"
         return f"codex hooks already installed in {path} (no changes)"
     return f"installed codex hooks ({', '.join(added)}) in {path}"
 
@@ -566,11 +686,13 @@ def codex_expected_trust(hooks_path: Path | None = None) -> dict[str, str]:
                 if str(handler.get("command", "")) != CODEX_HOOK_COMMAND:
                     continue
                 timeout = handler.get("timeout")
+                # Hash what Codex will hash: a handler with no timeout is normalized to
+                # Codex's own default, NOT to ours, before its identity is hashed.
                 entries[codex_hook_state_key(path, label, group_index, handler_index)] = (
                     codex_hook_trust_hash(
                         label,
                         CODEX_HOOK_COMMAND,
-                        HOOK_TIMEOUT if timeout is None else int(timeout),
+                        CODEX_DEFAULT_TIMEOUT if timeout is None else int(timeout),
                     )
                 )
     return entries
@@ -813,7 +935,7 @@ def _install_codex_notify(*, dry_run: bool) -> str:
     head = text[start:end]
 
     existing = _NOTIFY_LINE.search(head)
-    if existing and not _APC_NOTIFY.search(head):
+    if existing and not _codex_notify_installed(head):
         return (
             f"{path} already sets notify:\n"
             f"    {existing.group(0).strip()}\n"
@@ -849,18 +971,57 @@ CODEX_TRUST_ALTERNATIVE = (
 def _install_codex(*, dry_run: bool, legacy: bool = False, trust: bool = True) -> str:
     if legacy:
         return _install_codex_notify(dry_run=dry_run)
-    message = _install_codex_hooks(dry_run=dry_run)
     if not trust:
-        return f"{message}\n{CODEX_TRUST_ALTERNATIVE}"
-    entries = (
-        _planned_codex_trust() if dry_run else codex_expected_trust()
-    )  # dry run has nothing on disk to read back
-    return f"{message}\n{_install_codex_trust(entries, dry_run=dry_run)}"
+        return f"{_install_codex_hooks(dry_run=dry_run)}\n{CODEX_TRUST_ALTERNATIVE}"
+    if dry_run:
+        # dry run has nothing on disk to read back
+        message = _install_codex_hooks(dry_run=True)
+        return f"{message}\n{_install_codex_trust(_planned_codex_trust(), dry_run=True)}"
+
+    # An untrusted hook never runs, so a hooks.json we cannot trust is worse than no
+    # install at all: parse config.toml first, and put hooks.json back if the trust
+    # step fails anyway. Half an install is the one outcome with no error to act on.
+    _check_codex_config()
+    hooks_path = codex_hooks_path()
+    before = hooks_path.read_bytes() if hooks_path.is_file() else None
+    message = _install_codex_hooks(dry_run=False)
+    try:
+        trust_message = _install_codex_trust(codex_expected_trust(), dry_run=False)
+    except BaseException:
+        if before is None:
+            hooks_path.unlink(missing_ok=True)
+        else:
+            hooks_path.write_bytes(before)
+        raise
+    return f"{message}\n{trust_message}"
+
+
+def _check_codex_config() -> None:
+    """Fail before anything is written if ``config.toml`` is unreadable or malformed."""
+    path = codex_config_path()
+    if not path.exists():
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigFormatError(
+            f"{path} could not be read as UTF-8 text ({exc}). "
+            "Fix or move the file, then re-run the install."
+        ) from exc
+    _parse_toml(path, text)
 
 
 def _planned_codex_trust() -> dict[str, str]:
-    """What ``codex_expected_trust`` would return once the hooks are on disk."""
-    entries = codex_expected_trust()
+    """What ``codex_expected_trust`` would return once the hooks are on disk.
+
+    The install normalizes every handler of ours to ``HOOK_TIMEOUT``, so that is what
+    the entries will hash to - whatever timeout (or none) the file carries today.
+    """
+    entries = {
+        # "<abs hooks.json>:<label>:<group>:<handler>"
+        key: codex_hook_trust_hash(key.rsplit(":", 3)[1], CODEX_HOOK_COMMAND, HOOK_TIMEOUT)
+        for key in codex_expected_trust()
+    }
     path = codex_hooks_path()
     for event in CODEX_HOOK_EVENTS:
         label = codex_event_label(event)
@@ -912,7 +1073,7 @@ def _uninstall_codex() -> str:
         text = config.read_text(encoding="utf-8")
         start, end = _top_level_region(text)
         head = text[start:end]
-        if _APC_NOTIFY.search(head):
+        if _codex_notify_installed(head):
             cleaned = _NOTIFY_LINE.sub("", head, count=1)
             cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
             _write_atomic(config, cleaned + text[end:])

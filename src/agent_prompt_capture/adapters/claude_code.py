@@ -9,7 +9,15 @@ from __future__ import annotations
 from typing import Any
 
 from ..pii import scrub_path
-from . import Adapted, AdapterError, RawPrompt, RawTurnEnd, coerce_dict, coerce_str
+from . import (
+    Adapted,
+    AdapterError,
+    RawPrompt,
+    RawTurnEnd,
+    coerce_dict,
+    coerce_str,
+    project_from_cwd,
+)
 
 __all__ = ["parse", "PROMPT_EVENT", "TURN_END_EVENT"]
 
@@ -35,6 +43,11 @@ def parse(payload: Any) -> Adapted:
         if data.get("stop_hook_active") is True:
             # Claude Code is continuing *because of* a stop hook: not a real turn end.
             return None
+        if _has_background_work(data):
+            # hook-specs.md 6.a: a non-empty ``background_tasks`` means "paused waiting
+            # on background work", not "done". Ending the turn here would understate
+            # agent time; the next real Stop closes it.
+            return None
         return RawTurnEnd(
             session_id=coerce_str(data.get("session_id")),
             ts=coerce_str(data.get("ts")),
@@ -56,10 +69,16 @@ def parse(payload: Any) -> Adapted:
         prompt=prompt,
         session_id=coerce_str(data.get("session_id")),
         cwd=cwd,
-        project=_project(cwd),
+        project=project_from_cwd(cwd),
         metadata=_metadata(data),
         ts=coerce_str(data.get("ts")),
     )
+
+
+def _has_background_work(data: dict[str, Any]) -> bool:
+    """``background_tasks`` is present and non-empty (the registry is reachable)."""
+    tasks = data.get("background_tasks")
+    return bool(tasks) if isinstance(tasks, list) else False
 
 
 def _metadata(data: dict[str, Any]) -> dict[str, Any]:
@@ -73,10 +92,3 @@ def _metadata(data: dict[str, Any]) -> dict[str, Any]:
     if transcript:
         metadata["transcript_path"] = scrub_path(transcript)
     return metadata
-
-
-def _project(cwd: str | None) -> str | None:
-    if not cwd:
-        return None
-    parts = [p for p in cwd.replace("\\", "/").split("/") if p]
-    return parts[-1] if parts else None

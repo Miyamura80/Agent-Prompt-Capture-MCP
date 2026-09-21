@@ -134,6 +134,24 @@ def test_get_token_regenerates_when_blank(config):
     assert config.get_token().strip()
 
 
+def test_rotate_token_never_writes_through_a_planted_tmp_symlink(config, tmp_path):
+    """A pre-created ``token.tmp`` symlink must not receive the fresh secret."""
+    victim = tmp_path / "victim"
+    victim.write_text("untouched\n", encoding="utf-8")
+    planted = config.token_path.with_name(config.token_path.name + ".tmp")
+    planted.symlink_to(victim)
+
+    token = config.rotate_token()
+
+    assert victim.read_text(encoding="utf-8") == "untouched\n"
+    assert config.get_token() == token
+    assert not config.token_path.is_symlink()
+    assert stat.S_IMODE(config.token_path.stat().st_mode) == 0o600
+    # nothing but the token file (and the planted link) is left behind
+    leftovers = [p.name for p in config.home.glob("token.*") if p != planted]
+    assert leftovers == []
+
+
 def test_setup_logging_never_touches_stdout(apc_home, monkeypatch, capsys):
     monkeypatch.setattr(config_mod, "_LOGGING_CONFIGURED", False)
     logger = setup_logging(apc_home, force=True)

@@ -686,7 +686,15 @@ candidate list, tolerate total failure, never capture when the account is unknow
 **(a) Account email — ASSUMPTION.** Try, with `credentials: "include"`, from the content
 script: `/api/bootstrap`, `/api/account`, `/api/organizations`, then
 `/api/organizations/<org_uuid>/account`. Deep-search each JSON body for the first value
-matching `/^[^@\s]+@[^@\s]+\.[^@\s]+$/`. The field is most likely spelled
+matching `/^[^@\s]+@[^@\s]+\.[^@\s]+$/`.
+
+> **Superseded (see ARCHITECTURE.md "Chrome extension contracts" and
+> extension/README.md).** The deep search was dropped: `/api/organizations` describes the
+> *organisations* the session belongs to and can list other members, so the first email in
+> the body is not necessarily the viewer. The shipped detection reads a current-user field
+> (`email_address`/`email` on the payload root or on its `account`/`current_account`/
+> `user`/`profile` object) from `/api/auth/current_account` then `/api/account`, and
+> returns `null` otherwise. The rest of this section still holds. The field is most likely spelled
 `email_address` — that is the spelling in the documented Admin API
 (<https://platform.claude.com/docs/en/manage-claude/admin-api>, accessed 2026-09-19) —
 but I could not confirm it for the claude.ai internal endpoints. Cache per tab for 10

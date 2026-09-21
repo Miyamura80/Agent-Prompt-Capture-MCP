@@ -142,5 +142,24 @@ check('preScrubPayload scrubs the prompt but keeps the account intact', () => {
   assert.equal(payload.prompt, 'email me@work.com about sk-abcdefghij0123456789ABCD', 'input untouched');
 });
 
+/* --------------------------------------------- placeholder format contract */
+
+check('markers are flat, never the server\'s numbered form', () => {
+  // The listener numbers its own placeholders per record ([EMAIL_1],
+  // [API_KEY_2], ...). It cannot renumber or count what we replaced here - the
+  // raw value is gone - so our markers stay deliberately un-numbered: a flat
+  // [EMAIL] can never be confused with a server placeholder standing for a
+  // different value in the same prompt. See lib/prescrub.js for the reasoning
+  // and extension/README.md for what it costs (no pii_findings for these).
+  const out = preScrub('a@b.com and c@d.io and sk-abcdefghij0123456789ABCD');
+  assert.equal(out, '[EMAIL] and [EMAIL] and [API_KEY]');
+  assert.equal(/\[(EMAIL|API_KEY)_\d+\]/.test(out), false, out);
+});
+
+check('a server placeholder in the text is left alone', () => {
+  const text = 'the listener wrote [EMAIL_1] and [API_KEY_2] here';
+  assert.equal(preScrub(text), text);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

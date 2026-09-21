@@ -190,7 +190,8 @@ def test_time_summary_by_source(loaded, cfg):
 def test_time_summary_by_session(loaded, cfg):
     summary = time_summary(loaded, config=cfg, since=at("00:00"), group_by="session")
     keys = {g["key"]: g["prompt_count"] for g in summary["groups"]}
-    assert keys == {"s1": 3, "s2": 2}
+    # The key is "<source>:<session_id>" - session ids are only unique per agent.
+    assert keys == {"claude_code:s1": 3, "claude_code:s2": 2}
 
 
 @pytest.mark.parametrize("group_by", ["day", "hour_of_day", "weekday"])
@@ -553,3 +554,85 @@ def test_daily_digest_does_not_double_count_the_midnight_boundary(store, cfg, ne
     store.insert(make_record("on the stroke", ts="2026-07-16T04:00:00.000Z", session_id="x"))
     assert daily_digest(store, config=cfg, date="2026-07-15")["prompt_count"] == 0
     assert daily_digest(store, config=cfg, date="2026-07-16")["prompt_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# review regressions (cubic)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def utc_zone(monkeypatch):
+    """Pin the local zone to UTC so a day boundary is a fixed instant."""
+    import time as time_mod
+
+    monkeypatch.setenv("TZ", "UTC")
+    time_mod.tzset()
+    yield
+    monkeypatch.undo()
+    time_mod.tzset()
+
+
+def test_daily_digest_clips_a_turn_that_crosses_local_midnight(store, cfg, utc_zone):
+    """A turn running past midnight must not be credited to (or reported on) this day."""
+    store.insert(
+        make_record(
+            "kicked off a long build",
+            ts="2026-09-19T23:50:00.000Z",
+            turn_end_ts="2026-09-20T00:30:00.000Z",
+            project="alpha",
+            session_id="late",
+        )
+    )
+    digest = daily_digest(store, config=cfg, date=DAY)
+    assert digest["last_activity"] == "2026-09-20T00:00:00.000Z"
+    assert digest["active_minutes"] == 10.0  # 23:50 -> midnight, not 23:50 -> 00:35
+    assert digest["sessions"][0]["end"] == "2026-09-20T00:00:00.000Z"
+    assert digest["sessions"][0]["active_minutes"] == 10.0
+
+
+def test_daily_digest_clips_the_tail_at_midnight(store, cfg, utc_zone):
+    """The 5-minute tail must not spill into tomorrow either."""
+    store.insert(
+        make_record(
+            "last thing tonight",
+            ts="2026-09-19T23:58:00.000Z",
+            turn_end_ts="2026-09-19T23:59:00.000Z",
+            project="alpha",
+            session_id="tail",
+        )
+    )
+    digest = daily_digest(store, config=cfg, date=DAY)
+    assert digest["active_minutes"] == 2.0  # 23:58 -> midnight, not 1 + 5 tail
+    assert digest["last_activity"] == at("23:59")
+
+
+def test_activity_timeline_keeps_a_prompt_landing_exactly_on_until(store, cfg):
+    """`until` is inclusive in the store, so its bucket must exist."""
+    store.insert(make_record("on the edge", ts=at("12:00"), project="alpha"))
+    result = activity_timeline(
+        store, config=cfg, since=at("10:00"), until=at("12:00"), bucket="hour"
+    )
+    assert sum(b["prompt_count"] for b in result["buckets"]) == 1
+
+
+def test_source_totals_are_not_split_by_project(loaded, cfg):
+    """Grouping a source's stream per project loses the time between two projects."""
+    summary = time_summary(loaded, config=cfg, since=at("00:00"), group_by="source")
+    assert [g["key"] for g in summary["groups"]] == ["claude_code"]
+    assert summary["groups"][0]["active_minutes"] == EXPECTED_TOTAL_ACTIVE
+
+
+def test_two_sources_sharing_a_session_id_stay_apart(store, cfg):
+    """Session ids are only unique per agent; the group key carries the source."""
+    store.insert(
+        make_record("claude side", ts=at("09:00"), source=Source.CLAUDE_CODE, session_id="1")
+    )
+    store.insert(
+        make_record("opencode side", ts=at("09:05"), source=Source.OPENCODE, session_id="1")
+    )
+    summary = time_summary(store, config=cfg, since=at("00:00"), group_by="session")
+    assert {g["key"]: g["prompt_count"] for g in summary["groups"]} == {
+        "claude_code:1": 1,
+        "opencode:1": 1,
+    }

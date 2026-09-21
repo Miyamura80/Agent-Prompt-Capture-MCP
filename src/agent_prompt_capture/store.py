@@ -6,14 +6,14 @@ import json
 import sqlite3
 import threading
 from collections.abc import Iterable, Sequence
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .config import db_path
-from .models import PromptRecord, Source
+from .config import db_path, ensure_home
+from .models import PromptRecord, Source, utc_now_iso
+from .timeutil import MAX_FUTURE_SKEW_SECONDS, parse_time
 from .timeutil import parse_dt as _parse_dt
-from .timeutil import parse_time
 
 __all__ = [
     "Store",
@@ -89,6 +89,23 @@ def _source_list(source: Source | str | Iterable[Source | str] | None) -> list[s
     return [v for v in (_source_value(s) for s in source) if v]
 
 
+def _resolve_end_ts(ts: str | None) -> str:
+    """Normalise a client-supplied turn-end timestamp under the same clock policy as
+    a prompt ``ts``: unparseable or implausibly future values fall back to our clock."""
+    try:
+        value = parse_time(ts) if ts else None
+    except ValueError:
+        value = None
+    if value is None:
+        return utc_now_iso()
+    parsed = _parse_dt(value)
+    if parsed is not None and (parsed - datetime.now(UTC)).total_seconds() > (
+        MAX_FUTURE_SKEW_SECONDS
+    ):
+        return utc_now_iso()
+    return value
+
+
 def _fts_escape(query: str) -> str:
     """Make a user query safe for FTS5 while keeping its operators when it parses."""
     return '"' + query.replace('"', '""') + '"'
@@ -99,7 +116,9 @@ class Store:
 
     def __init__(self, path: Path | str | None = None) -> None:
         self.path = Path(path) if path is not None else db_path()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # The prompt archive is private: create the runtime directory 0700 rather than
+        # leaving it at whatever the umask allows.
+        ensure_home(self.path.parent)
         self._lock = threading.RLock()
         self._conn = sqlite3.connect(
             str(self.path), check_same_thread=False, timeout=BUSY_TIMEOUT_MS / 1000.0
@@ -148,10 +167,14 @@ class Store:
     def insert(self, rec: PromptRecord) -> bool:
         """Insert a record. Returns ``False`` when it was deduplicated."""
         with self._lock:
-            if self._is_duplicate(rec):
-                return False
             try:
+                # BEGIN IMMEDIATE takes the write lock up front, so a second process
+                # cannot slip its own INSERT between our dedup check and ours. It waits
+                # up to ``busy_timeout`` for the lock like any other writer.
                 with self._conn:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    if self._is_duplicate(rec):
+                        return False
                     self._conn.execute(
                         "INSERT INTO prompts (id, ts, source, prompt, prompt_hash, session_id,"
                         " account, cwd, project, char_count, pii_findings, metadata, turn_end_ts)"
@@ -211,19 +234,21 @@ class Store:
         """
         if not session_id:
             return None
-        value = parse_time(ts) if ts else None
-        if value is None:
-            from .models import utc_now_iso
-
-            value = utc_now_iso()
+        value = _resolve_end_ts(ts)
         with self._lock, self._conn:
             row = self._conn.execute(
-                "SELECT id FROM prompts WHERE source=? AND session_id=? AND turn_end_ts IS NULL"
-                " ORDER BY ts DESC LIMIT 1",
+                "SELECT id, ts FROM prompts WHERE source=? AND session_id=?"
+                " AND turn_end_ts IS NULL ORDER BY ts DESC LIMIT 1",
                 (_source_value(source), session_id),
             ).fetchone()
             if row is None:
                 return None
+            # A turn cannot end before it started: a stale client clock must not write
+            # a negative duration into the row.
+            started = _parse_dt(row["ts"])
+            ended = _parse_dt(value)
+            if started is not None and (ended is None or ended < started):
+                value = str(row["ts"])
             self._conn.execute("UPDATE prompts SET turn_end_ts=? WHERE id=?", (value, row["id"]))
             return str(row["id"])
 

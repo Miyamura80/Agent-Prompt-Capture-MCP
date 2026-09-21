@@ -47,24 +47,34 @@ jobs:
         with:
           node-version: "22"
 
+      # Both files are checked in, so a missing one is a bug, not a reason to skip:
+      # `|| echo skip` used to swallow a malformed manifest as a green build.
       - name: Validate extension/manifest.json
         run: |
-          test -f extension/manifest.json && \
-            node -e "JSON.parse(require('fs').readFileSync('extension/manifest.json'))" || echo skip
+          test -f extension/manifest.json
+          node -e "JSON.parse(require('fs').readFileSync('extension/manifest.json'))"
 
       - name: Validate the OpenCode plugin parses
         run: |
-          test -f opencode-plugin/agent-prompt-capture.js && \
-            node --input-type=module --check < opencode-plugin/agent-prompt-capture.js || echo skip
+          test -f opencode-plugin/agent-prompt-capture.js
+          node --input-type=module --check < opencode-plugin/agent-prompt-capture.js
+
+      # Pure-node unit tests for the two libraries the service worker shares
+      # with the options page: no browser and no dependencies needed.
+      - name: Extension unit tests
+        run: |
+          node extension/scripts/test-prescrub.js
+          node extension/scripts/test-limits.js
 
   e2e:
     name: end-to-end
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # extension/scripts/smoke.mjs defaults this to /opt/pw-browsers (the shared
-      # pool on the dev image). Pin it to a writable path here so the browser the
-      # install step downloads is the one Playwright then finds.
+      # smoke.mjs only falls back to /opt/pw-browsers (the shared pool on the dev
+      # image) when this is unset and that directory exists. Pin it to a writable
+      # path here so the browser the install step downloads is the one Playwright
+      # then finds.
       PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.pw-browsers
     steps:
       - uses: actions/checkout@v4
@@ -91,8 +101,8 @@ jobs:
       # bare ubuntu-latest runner.
       - name: Install Chromium for Playwright
         run: |
-          npm install --no-save playwright@latest
-          npx playwright install chromium --with-deps
+          npm install --prefix extension
+          ./extension/node_modules/.bin/playwright install chromium --with-deps
 
       - name: Install xvfb
         run: sudo apt-get install -y --no-install-recommends xvfb

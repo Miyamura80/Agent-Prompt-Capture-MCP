@@ -5,15 +5,25 @@
  *   - receive {type:"capture", payload} from the content scripts
  *   - apply the light pre-scrub (defence in depth; the listener does the real one)
  *   - POST to `${serverUrl}/v1/prompts` with the X-APC-Token header
- *   - queue failures in chrome.storage.local (cap 500, drop oldest) and retry
- *     from a 1-minute chrome.alarms tick with exponential backoff
+ *   - queue failures in chrome.storage.local (500 items / 4 MiB, drop oldest)
+ *     and retry from a 1-minute chrome.alarms tick with exponential backoff
  *   - answer {type:"status"} / {type:"testConnection"} / {type:"clearQueue"}
  *     for the popup and the options page
  *
- * The only origin this worker ever talks to is the configured serverUrl.
+ * The only origin this worker ever talks to is the configured serverUrl, and
+ * that URL must be a loopback http:// listener (lib/limits.isLoopbackServerUrl)
+ * - see request(), which refuses anything else before fetch() is reached.
  */
 
 import { preScrubPayload } from './lib/prescrub.js';
+import {
+  QUEUE_MAX_BYTES,
+  QUEUE_MAX_ITEMS,
+  capPayloadBytes,
+  isLoopbackServerUrl,
+  normaliseServerUrl,
+  trimQueueToBudget,
+} from './lib/limits.js';
 
 export const CLIENT_VERSION = '0.1.0';
 
@@ -29,7 +39,6 @@ const SYNC_DEFAULTS = {
 };
 
 const QUEUE_KEY = 'apc_queue';
-const QUEUE_MAX = 500;
 const CAPTURES_KEY = 'apc_captures';
 const LAST_ERROR_KEY = 'apc_last_error';
 const TOKEN_KEY = 'token';
@@ -37,7 +46,6 @@ const RETRY_ALARM = 'apc-retry';
 const DAY_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 8000;
 const MAX_BACKOFF_MINUTES = 60;
-const MAX_PROMPT_CHARS = 500000; // keeps us well under the listener's 1 MiB cap
 
 const VALID_SOURCES = new Set([
   'claude_web',
@@ -68,13 +76,14 @@ export async function getToken() {
   return String(stored[TOKEN_KEY] || '');
 }
 
-function normaliseServerUrl(url) {
-  return String(url || '').trim().replace(/\/+$/, '');
-}
-
 /* ------------------------------------------------------------------- http */
 
 async function request(url, { method = 'GET', headers = {}, body } = {}) {
+  // The single chokepoint for every outbound call: nothing leaves the worker
+  // for anywhere but the local listener, whatever chrome.storage.sync says.
+  if (!isLoopbackServerUrl(url)) {
+    throw new Error(`refusing to contact ${url || '(no server URL)'}: the listener must be http://127.0.0.1 or http://localhost`);
+  }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
@@ -100,6 +109,13 @@ async function request(url, { method = 'GET', headers = {}, body } = {}) {
   }
 }
 
+/**
+ * POST one payload. Throws only on a transport/HTTP failure (those are worth a
+ * retry). A 2xx is a *delivered* payload even when the listener declined to
+ * store it, so the caller gets the body and decides what it means:
+ * `{stored: true, id}` is a capture, `{stored: false, reason}` is not
+ * (http_listener.do_POST: source_disabled / account_not_allowed / deduped).
+ */
 async function postPrompt(payload, options, token) {
   if (!options.serverUrl) throw new Error('No server URL configured');
   const res = await request(`${options.serverUrl}/v1/prompts`, {
@@ -113,7 +129,13 @@ async function postPrompt(payload, options, token) {
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}${res.text ? `: ${res.text.slice(0, 200)}` : ''}`);
   }
-  return res.json;
+  const body = res.json;
+  const stored = !!(body && body.stored === true);
+  return {
+    stored,
+    reason: body && typeof body.reason === 'string' ? body.reason : null,
+    body,
+  };
 }
 
 export async function checkHealth(serverUrl) {
@@ -160,14 +182,34 @@ async function getLastError() {
   return stored[LAST_ERROR_KEY] || null;
 }
 
-async function recordCapture() {
-  const stored = await chrome.storage.local.get({ [CAPTURES_KEY]: [] });
-  const cutoff = Date.now() - DAY_MS;
-  const list = (Array.isArray(stored[CAPTURES_KEY]) ? stored[CAPTURES_KEY] : [])
-    .filter((t) => typeof t === 'number' && t >= cutoff);
-  list.push(Date.now());
-  await chrome.storage.local.set({ [CAPTURES_KEY]: list });
-  return list.length;
+/**
+ * Serialise every read-modify-write of the captures list, the same way the
+ * queue is serialised: two concurrent captures must not read the same list and
+ * write back a single timestamp between them.
+ */
+let capturesChain = Promise.resolve();
+
+function withCapturesLock(fn) {
+  const run = capturesChain.then(() => fn());
+  capturesChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+/** Add `n` capture timestamps (only ever called for `stored: true` records). */
+async function recordCaptures(n) {
+  if (!(n > 0)) return countLast24h();
+  return withCapturesLock(async () => {
+    const stored = await chrome.storage.local.get({ [CAPTURES_KEY]: [] });
+    const cutoff = Date.now() - DAY_MS;
+    const list = (Array.isArray(stored[CAPTURES_KEY]) ? stored[CAPTURES_KEY] : [])
+      .filter((t) => typeof t === 'number' && t >= cutoff);
+    for (let i = 0; i < n; i += 1) list.push(Date.now());
+    await chrome.storage.local.set({ [CAPTURES_KEY]: list });
+    return list.length;
+  });
 }
 
 async function countLast24h() {
@@ -179,13 +221,60 @@ async function countLast24h() {
 
 /* ------------------------------------------------------------------ queue */
 
+/**
+ * Every queue read-modify-write goes through this one promise chain. The
+ * worker is single-threaded but `await` is not: a capture and the alarm's
+ * flush could otherwise both read the same array and write back a version that
+ * silently loses the other's item.
+ */
+let queueChain = Promise.resolve();
+
+function withQueueLock(fn) {
+  const run = queueChain.then(() => fn());
+  queueChain = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 async function readQueue() {
   const stored = await chrome.storage.local.get({ [QUEUE_KEY]: [] });
   return Array.isArray(stored[QUEUE_KEY]) ? stored[QUEUE_KEY] : [];
 }
 
+/**
+ * Persist the queue inside both budgets (500 items AND 4 MiB of serialized
+ * JSON, so 500 near-1 MiB prompts cannot blow the 10 MiB storage.local quota),
+ * and treat a quota rejection as "drop the oldest half and try again" rather
+ * than as a lost capture.
+ *
+ * @returns {Promise<{queue: object[], dropped: number}>} what is now stored
+ */
 async function writeQueue(queue) {
-  await chrome.storage.local.set({ [QUEUE_KEY]: queue.slice(-QUEUE_MAX) });
+  const trimmed = trimQueueToBudget(queue, {
+    maxItems: QUEUE_MAX_ITEMS,
+    maxBytes: QUEUE_MAX_BYTES,
+  });
+  let candidate = trimmed.kept;
+  let dropped = trimmed.dropped;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      await chrome.storage.local.set({ [QUEUE_KEY]: candidate });
+      return { queue: candidate, dropped };
+    } catch (err) {
+      // QUOTA_BYTES / QUOTA_BYTES_PER_ITEM, or the profile's disk is full.
+      if (candidate.length === 0) {
+        await setLastError(`Could not persist the retry queue: ${describeError(err)}`);
+        return { queue: [], dropped };
+      }
+      const half = Math.max(1, Math.floor(candidate.length / 2));
+      dropped += half;
+      candidate = candidate.slice(half); // the oldest go first
+    }
+  }
+  await setLastError('Could not persist the retry queue (storage quota exceeded)');
+  return { queue: [], dropped: dropped + candidate.length };
 }
 
 export function backoffMs(attempts) {
@@ -194,53 +283,90 @@ export function backoffMs(attempts) {
 }
 
 async function enqueue(payload) {
-  const queue = await readQueue();
-  queue.push({ payload, attempts: 1, nextAt: Date.now() + backoffMs(1) });
-  // cap 500, drop oldest
-  await writeQueue(queue);
+  const result = await withQueueLock(async () => {
+    const queue = await readQueue();
+    queue.push({ payload, attempts: 1, nextAt: Date.now() + backoffMs(1) });
+    return writeQueue(queue);
+  });
+  if (result.dropped > 0) {
+    await setLastError(`Retry queue full: dropped ${result.dropped} older capture(s)`);
+  }
   await ensureRetryAlarm();
+  return result;
+}
+
+/**
+ * Why an item may no longer be posted. The worker's allowlist checks are not
+ * only for fresh captures: a queued prompt belongs to a source or an account
+ * the user may have turned off *after* the POST failed, and replaying it then
+ * would send data the current settings forbid.
+ */
+function queueItemProblem(payload, options) {
+  const problem = validatePayload(payload);
+  if (problem) return problem;
+  if (options.sources[payload.source] === false) return 'source_disabled';
+  const account = String(payload.account).trim().toLowerCase();
+  if (options.allowedAccounts.length === 0 || !options.allowedAccounts.includes(account)) {
+    return 'account_not_allowed';
+  }
+  return null;
 }
 
 async function flushQueue() {
-  let queue = await readQueue();
-  if (queue.length === 0) return { sent: 0, remaining: 0 };
+  return withQueueLock(async () => {
+    let queue = await readQueue();
+    if (queue.length === 0) return { sent: 0, stored: 0, dropped: 0, remaining: 0 };
 
-  const options = await getOptions();
-  const token = await getToken();
-  const now = Date.now();
-  const keep = [];
-  let sent = 0;
-  let lastError = null;
-
-  for (const item of queue) {
-    if (!item || !item.payload) continue;
-    if (typeof item.nextAt === 'number' && item.nextAt > now) {
-      keep.push(item);
-      continue;
+    const options = await getOptions();
+    if (!isLoopbackServerUrl(options.serverUrl)) {
+      // Nothing may be posted anywhere else, and retrying would never succeed.
+      const message = `Server URL ${options.serverUrl || '(unset)'} is not a local listener; not retrying`;
+      await setLastError(message);
+      return { sent: 0, stored: 0, dropped: 0, remaining: queue.length, error: message };
     }
-    try {
-      await postPrompt(item.payload, options, token);
-      sent += 1;
-    } catch (err) {
-      lastError = describeError(err);
-      const attempts = (item.attempts || 0) + 1;
-      keep.push({ ...item, attempts, nextAt: Date.now() + backoffMs(attempts) });
-    }
-  }
+    const token = await getToken();
+    const now = Date.now();
+    const keep = [];
+    let sent = 0;
+    let stored = 0;
+    let dropped = 0;
+    let lastError = null;
 
-  queue = keep;
-  await writeQueue(queue);
-  if (sent > 0) {
-    const stored = await chrome.storage.local.get({ [CAPTURES_KEY]: [] });
-    const cutoff = Date.now() - DAY_MS;
-    const list = (Array.isArray(stored[CAPTURES_KEY]) ? stored[CAPTURES_KEY] : [])
-      .filter((t) => typeof t === 'number' && t >= cutoff);
-    for (let i = 0; i < sent; i += 1) list.push(Date.now());
-    await chrome.storage.local.set({ [CAPTURES_KEY]: list });
-  }
-  if (lastError) await setLastError(`Retry failed: ${lastError}`);
-  else if (sent > 0) await setLastError(null);
-  return { sent, remaining: queue.length };
+    for (const item of queue) {
+      if (!item || !item.payload) {
+        dropped += 1;
+        continue;
+      }
+      // Re-check against the settings as they are *now*, not as they were when
+      // the capture was queued.
+      if (queueItemProblem(item.payload, options)) {
+        dropped += 1;
+        continue;
+      }
+      if (typeof item.nextAt === 'number' && item.nextAt > now) {
+        keep.push(item);
+        continue;
+      }
+      try {
+        const result = await postPrompt(item.payload, options, token);
+        // Delivered: dequeue either way. Only a stored record is a capture.
+        sent += 1;
+        if (result.stored) stored += 1;
+      } catch (err) {
+        lastError = describeError(err);
+        const attempts = (item.attempts || 0) + 1;
+        keep.push({ ...item, attempts, nextAt: Date.now() + backoffMs(attempts) });
+      }
+    }
+
+    const written = await writeQueue(keep);
+    queue = written.queue;
+    dropped += written.dropped;
+    if (stored > 0) await recordCaptures(stored);
+    if (lastError) await setLastError(`Retry failed: ${lastError}`);
+    else if (sent > 0) await setLastError(null);
+    return { sent, stored, dropped, remaining: queue.length };
+  });
 }
 
 async function ensureRetryAlarm() {
@@ -271,6 +397,13 @@ export async function handleCapture(rawPayload) {
   const options = await getOptions();
   const account = String(rawPayload.account).trim().toLowerCase();
 
+  if (!isLoopbackServerUrl(options.serverUrl)) {
+    // Never queue this: the destination itself is the problem, and a queued
+    // payload would just keep trying to leave the machine.
+    const message = `Server URL ${options.serverUrl || '(unset)'} is not a local listener (http://127.0.0.1 or http://localhost)`;
+    await setLastError(message);
+    return { ok: false, reason: 'server_not_loopback', error: message };
+  }
   if (options.sources[rawPayload.source] === false) {
     return { ok: false, reason: 'source_disabled' };
   }
@@ -283,17 +416,22 @@ export async function handleCapture(rawPayload) {
   payload.account = account;
   payload.client_version = CLIENT_VERSION;
   if (!payload.ts) payload.ts = new Date().toISOString();
-  if (payload.prompt.length > MAX_PROMPT_CHARS) {
-    payload.prompt = payload.prompt.slice(0, MAX_PROMPT_CHARS);
-    payload.truncated = true;
-  }
+  payload = capPayloadBytes(payload);
 
   const token = await getToken();
   try {
-    const body = await postPrompt(payload, options, token);
-    await recordCapture();
+    const result = await postPrompt(payload, options, token);
+    // A 202 with `stored: false` (deduped, disabled, not allowlisted) is a
+    // delivered payload that is NOT a capture: it must not raise last24h.
+    if (result.stored) await recordCaptures(1);
     await setLastError(null);
-    return { ok: true, queued: false, response: body };
+    return {
+      ok: true,
+      queued: false,
+      stored: result.stored,
+      reason: result.reason,
+      response: result.body,
+    };
   } catch (err) {
     const message = describeError(err);
     await enqueue(payload);
@@ -363,11 +501,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       );
       return true;
     case 'clearQueue':
-      (async () => {
+      withQueueLock(async () => {
         await chrome.storage.local.set({ [QUEUE_KEY]: [] });
         await setLastError(null);
         return { ok: true, queued: 0 };
-      })().then(sendResponse, (err) => sendResponse({ ok: false, error: describeError(err) }));
+      }).then(sendResponse, (err) => sendResponse({ ok: false, error: describeError(err) }));
       return true;
     case 'flushQueue':
       flushQueue().then(

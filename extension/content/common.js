@@ -79,44 +79,14 @@
     return match ? match[0] : null;
   }
 
-  /**
-   * Deep search a JSON-ish object for the first value that looks like an email
-   * under a key named like email / email_address / emailAddress.
+  /*
+   * There is deliberately no "find any email in this JSON" helper here.
+   * Account detection must read a field that describes the *signed-in user*
+   * (see content/claude.js#currentUserEmail and content/chatgpt.js): the first
+   * email found anywhere in an API payload is just as likely to be a colleague,
+   * an org contact or a shared-project member, and stamping a capture with the
+   * wrong allowlisted identity is worse than capturing nothing.
    */
-  function findEmailInObject(value, depth) {
-    var d = typeof depth === 'number' ? depth : 0;
-    if (d > 6 || value == null) return null;
-    if (typeof value === 'string') return null;
-    if (Array.isArray(value)) {
-      for (var i = 0; i < value.length; i += 1) {
-        var fromItem = findEmailInObject(value[i], d + 1);
-        if (fromItem) return fromItem;
-      }
-      return null;
-    }
-    if (typeof value !== 'object') return null;
-    var keys = Object.keys(value);
-    var k;
-    var email;
-    // Prefer keys that are explicitly about an email address.
-    for (k = 0; k < keys.length; k += 1) {
-      if (/^(email|email_address|emailaddress|primary_email|contact_email)$/i.test(keys[k])) {
-        email = normaliseEmail(value[keys[k]]);
-        if (email) return email;
-      }
-    }
-    for (k = 0; k < keys.length; k += 1) {
-      if (/email/i.test(keys[k])) {
-        email = normaliseEmail(value[keys[k]]);
-        if (email) return email;
-      }
-    }
-    for (k = 0; k < keys.length; k += 1) {
-      var nested = findEmailInObject(value[keys[k]], d + 1);
-      if (nested) return nested;
-    }
-    return null;
-  }
 
   /**
    * Same-origin JSON GET that never throws. Any of these endpoints may 404,
@@ -144,88 +114,40 @@
 
   /* -------------------------------------------------------- account cache */
 
+  /*
+   * The detected account is cached in this content script's own memory and
+   * nowhere else. It is deliberately NOT kept in chrome.storage.session:
+   * that area is shared by every tab of the extension, so a second tab signed
+   * in as someone else would read the first tab's identity and stamp its
+   * prompts with it. Memory here is per document, i.e. per tab, and it dies
+   * with the page; a reload costs one extra same-origin fetch.
+   *
+   * Two further rules keep a stale identity out of a capture:
+   *   - only a *successful* detection is cached (a null would otherwise pin
+   *     "unknown" for the whole TTL, e.g. until after the user opens the
+   *     profile popover the DOM fallback reads)
+   *   - every URL change invalidates it (sign-out and account switches both
+   *     navigate), on top of the TTL
+   */
   var memoryCache = Object.create(null);
-  var sessionStorageUsable = null;
-
-  function sessionArea() {
-    if (sessionStorageUsable === false) return null;
-    try {
-      if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.session) {
-        sessionStorageUsable = false;
-        return null;
-      }
-      return chrome.storage.session;
-    } catch (err) {
-      sessionStorageUsable = false;
-      return null;
-    }
-  }
 
   function cacheGet(key) {
-    var now = Date.now();
-    var local = memoryCache[key];
-    if (local && local.expires > now) return Promise.resolve(local.value);
-
-    var area = sessionArea();
-    if (!area) return Promise.resolve(undefined);
-    return new Promise(function (resolve) {
-      try {
-        area.get(key, function (items) {
-          if (chrome.runtime.lastError) {
-            sessionStorageUsable = false;
-            resolve(undefined);
-            return;
-          }
-          sessionStorageUsable = true;
-          var entry = items && items[key];
-          if (entry && typeof entry.expires === 'number' && entry.expires > Date.now()) {
-            memoryCache[key] = entry;
-            resolve(entry.value);
-          } else {
-            resolve(undefined);
-          }
-        });
-      } catch (err) {
-        sessionStorageUsable = false;
-        resolve(undefined);
-      }
-    });
+    var entry = memoryCache[key];
+    if (entry && entry.expires > Date.now()) return Promise.resolve(entry.value);
+    if (entry) delete memoryCache[key];
+    return Promise.resolve(undefined);
   }
 
   function cacheSet(key, value) {
-    var entry = { value: value, expires: Date.now() + ACCOUNT_TTL_MS };
-    memoryCache[key] = entry;
-    var area = sessionArea();
-    if (!area) return Promise.resolve();
-    return new Promise(function (resolve) {
-      try {
-        var payload = {};
-        payload[key] = entry;
-        area.set(payload, function () {
-          if (chrome.runtime.lastError) sessionStorageUsable = false;
-          resolve();
-        });
-      } catch (err) {
-        sessionStorageUsable = false;
-        resolve();
-      }
-    });
+    // Never cache a miss: see above.
+    if (!value) return Promise.resolve();
+    memoryCache[key] = { value: value, expires: Date.now() + ACCOUNT_TTL_MS };
+    return Promise.resolve();
   }
 
   function cacheClear(key) {
     delete memoryCache[key];
-    var area = sessionArea();
-    if (!area) return Promise.resolve();
-    return new Promise(function (resolve) {
-      try {
-        area.remove(key, function () {
-          void chrome.runtime.lastError;
-          resolve();
-        });
-      } catch (err) {
-        resolve();
-      }
-    });
+    return Promise.resolve();
   }
 
   /* -------------------------------------------------------------- options */
@@ -411,6 +333,23 @@
       lastTs = Date.now();
     }
 
+    function forgetAccount() {
+      accountInFlight = null;
+      cacheClear(accountCacheKey);
+    }
+
+    /**
+     * Drop the cached account if the page has navigated since we last looked.
+     * Called from the mutation observer and again immediately before a capture,
+     * so a sign-out or an account switch can never stamp the next prompt with
+     * the previous identity.
+     */
+    function noteNavigation() {
+      if (location.href === lastHref) return;
+      lastHref = location.href;
+      forgetAccount();
+    }
+
     function resolveAccount(forceRefresh) {
       if (forceRefresh) {
         accountInFlight = null;
@@ -465,6 +404,7 @@
     }
 
     function finalize(text) {
+      noteNavigation();
       var source = site.detectSource ? site.detectSource() : detectSource();
       if (!source) return Promise.resolve({ captured: false, reason: 'unknown_source' });
       return getOptions().then(function (options) {
@@ -553,11 +493,10 @@
       if (!cachedComposer || !cachedComposer.isConnected) {
         cachedComposer = findComposer(composerSelectors);
       }
-      if (location.href !== lastHref) {
-        lastHref = location.href;
-        // Account is per-site, not per-conversation, so the cache survives a
-        // route change; the 10-minute TTL takes care of a real account switch.
-      }
+      // A sign-out or an account switch always changes the URL, and a stale
+      // identity would stamp the *next* user's prompt, so drop the cached
+      // account rather than waiting out the TTL.
+      noteNavigation();
     });
     try {
       observer.observe(document.documentElement || document, {
@@ -603,6 +542,13 @@
 
     // Warm the account cache so the first Enter is not racing a fetch.
     resolveAccount(false).catch(function () {});
+    // A bfcache restore can bring back a document that was signed in as
+    // somebody else; treat it like any other navigation.
+    globalThis.addEventListener('pageshow', function (event) {
+      if (!event || !event.persisted) return;
+      forgetAccount();
+      resolveAccount(false).catch(function () {});
+    });
 
     globalThis.APC.__installed = true;
     globalThis.APC.__site = site;
@@ -616,7 +562,6 @@
     ACCOUNT_TTL_MS: ACCOUNT_TTL_MS,
     detectSource: detectSource,
     normaliseEmail: normaliseEmail,
-    findEmailInObject: findEmailInObject,
     fetchJson: fetchJson,
     getOptions: getOptions,
     isAllowlisted: isAllowlisted,

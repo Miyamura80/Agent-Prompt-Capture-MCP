@@ -83,3 +83,19 @@ def test_to_iso_round_trip():
 @pytest.mark.parametrize("value", [None, "", "not a time"])
 def test_parse_dt_is_forgiving(value):
     assert parse_dt(value) is None
+
+
+@pytest.mark.parametrize("value", ["10000000000d", "99999999999999999999d", "9" * 400 + "y"])
+def test_oversized_durations_raise_value_error(value):
+    """An MCP caller's absurd bound is a bad value, not an ``OverflowError``."""
+    with pytest.raises(ValueError):
+        parse_duration(value)
+    with pytest.raises(ValueError):
+        parse_time(value)
+
+
+def test_a_duration_that_walks_off_the_calendar_raises_value_error():
+    # timedelta(days=3_650_000) is legal, ``now`` minus it is not a datetime.
+    assert parse_duration("3650000d").days == 3_650_000
+    with pytest.raises(ValueError):
+        parse_time("3650000d")
