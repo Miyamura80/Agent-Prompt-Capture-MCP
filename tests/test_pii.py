@@ -525,3 +525,34 @@ def test_a_grouped_iban_does_not_swallow_the_prose_after_it():
     result = scrub("send it to ES91 2100 0418 4502 0005 1332 TODAY PLEASE")
     assert result.findings == {"iban": 1}
     assert result.text == "send it to [IBAN_1] TODAY PLEASE"
+
+
+@pytest.mark.parametrize("word", ["OK", "EUR", "POST", "OPEN"])
+def test_a_grouped_iban_is_still_found_when_a_short_uppercase_word_follows(word):
+    """The greedy grouped alternative swallows 1-4 character words; we shorten it back.
+
+    ``finditer`` only ever yields the maximal match, so a candidate that fails mod-97
+    used to leave the account number stored in the clear.
+    """
+    result = scrub(f"send it to ES91 2100 0418 4502 0005 1332 {word} it")
+    assert result.findings == {"iban": 1}
+    assert result.text == f"send it to [IBAN_1] {word} it"
+
+
+def test_a_grouped_iban_ignores_a_trailing_four_digit_group():
+    """A following ``1234`` is ambiguous: it looks exactly like one more IBAN group.
+
+    We resolve it in favour of the country's registered length (ES is 24 characters),
+    so the IBAN is redacted and the extra group is left as ordinary text. Swallowing it
+    would be the unsafe choice: the whole candidate would then fail validation and the
+    account number would be stored unredacted.
+    """
+    result = scrub("send it to ES91 2100 0418 4502 0005 1332 1234 now")
+    assert result.findings == {"iban": 1}
+    assert result.text == "send it to [IBAN_1] 1234 now"
+
+
+def test_an_iban_of_the_wrong_length_for_its_country_is_not_redacted():
+    """``DE`` is 22 characters; this 24-character value passes mod-97 all the same."""
+    result = scrub("ref DE6537040044053201300012 here")
+    assert result.findings == {}

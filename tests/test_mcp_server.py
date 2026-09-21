@@ -306,38 +306,72 @@ async def test_resources_return_json(mcp, uri):
     assert isinstance(json.loads(text), dict)
 
 
-async def test_build_server_omits_version_on_an_mcp_1x_constructor(apc_home, store, monkeypatch):
-    """mcp 1.x ``FastMCP`` has no ``version`` keyword and raises ``TypeError`` on one."""
-    from agent_prompt_capture import mcp_server as module
+def _recording_server_class(seen: dict[str, object], *, takes_version: bool):
+    """A ``_server_class`` stand-in whose ``__init__`` records the kwargs it was given.
 
-    seen: dict[str, object] = {}
+    Both fakes accept ``**extra``, so a ``version`` that ``build_server`` should not have
+    passed lands in the recorded kwargs instead of raising ``TypeError`` — the assertion,
+    not the constructor, is what has to catch it.
+    """
 
-    class FakeFastMCP:
-        def __init__(self, name=None, instructions=None):
-            seen["name"] = name
-            seen["instructions"] = instructions
-
+    class _Recording:
         def tool(self, *args, **kwargs):
             return lambda fn: fn
 
         def resource(self, *args, **kwargs):
             return lambda fn: fn
 
-    monkeypatch.setattr(module, "_server_class", lambda: FakeFastMCP)
+    if takes_version:
+
+        class FakeServer(_Recording):
+            def __init__(self, name=None, instructions=None, version=None, **extra):
+                seen["kwargs"] = {
+                    "name": name,
+                    "instructions": instructions,
+                    "version": version,
+                    **extra,
+                }
+    else:
+
+        class FakeServer(_Recording):
+            def __init__(self, name=None, instructions=None, **extra):
+                seen["kwargs"] = {"name": name, "instructions": instructions, **extra}
+
+    return FakeServer
+
+
+async def test_build_server_omits_version_on_an_mcp_1x_constructor(apc_home, store, monkeypatch):
+    """mcp 1.x ``FastMCP`` has no ``version`` keyword and raises ``TypeError`` on one."""
+    from agent_prompt_capture import mcp_server as module
+
+    seen: dict[str, object] = {}
+    fake = _recording_server_class(seen, takes_version=False)
+    monkeypatch.setattr(module, "_server_class", lambda: fake)
+
     server = module.build_server(Config(home=apc_home), store)
 
-    assert isinstance(server, FakeFastMCP)
-    assert seen["name"] == "agent-prompt-capture"
-    assert seen["instructions"]
+    assert isinstance(server, fake)
+    kwargs = seen["kwargs"]
+    assert "version" not in kwargs
+    assert kwargs["name"] == "agent-prompt-capture"
+    assert kwargs["instructions"]
 
 
-async def test_build_server_passes_version_when_the_constructor_takes_one(apc_home, store):
-    """The installed SDK (mcp 2.x ``MCPServer``) still advertises our version."""
-    import inspect
-
+async def test_build_server_passes_version_when_the_constructor_takes_one(
+    apc_home, store, monkeypatch
+):
+    """mcp 2.x ``MCPServer`` takes a ``version``, and we advertise ours."""
     from agent_prompt_capture import __version__
-    from agent_prompt_capture.mcp_server import _server_class
+    from agent_prompt_capture import mcp_server as module
 
-    server = build_server(Config(home=apc_home), store)
-    if "version" in inspect.signature(_server_class().__init__).parameters:
-        assert getattr(server, "version", __version__) == __version__
+    seen: dict[str, object] = {}
+    fake = _recording_server_class(seen, takes_version=True)
+    monkeypatch.setattr(module, "_server_class", lambda: fake)
+
+    server = module.build_server(Config(home=apc_home), store)
+
+    assert isinstance(server, fake)
+    kwargs = seen["kwargs"]
+    assert kwargs["version"] == __version__
+    assert kwargs["name"] == "agent-prompt-capture"
+    assert kwargs["instructions"]

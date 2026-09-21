@@ -101,7 +101,7 @@ jobs:
       # bare ubuntu-latest runner.
       - name: Install Chromium for Playwright
         run: |
-          npm install --prefix extension
+          npm ci --prefix extension
           ./extension/node_modules/.bin/playwright install chromium --with-deps
 
       - name: Install xvfb

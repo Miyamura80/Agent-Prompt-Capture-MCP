@@ -273,11 +273,12 @@ Both sites are unversioned SPAs. The parts most likely to rot:
   * chatgpt.com: `user.email` from `/api/auth/session`. No fallback - the rest
     of that payload may carry unrelated addresses.
   * claude.ai: `/api/auth/current_account`, then `/api/account`, reading only
-    `email_address`/`email` on the document root or on its `account`,
-    `current_account`, `user` or `profile` object; then the DOM fallback, which
-    reads the profile popover while it is open. `/api/organizations` is
-    deliberately **not** used: it answers with the organisations the session
-    belongs to, and those can list other members.
+    a current-user field (`email_address`, `email`, `emailAddress` or
+    `primary_email` - `CURRENT_USER_FIELDS` in `content/claude.js`) on the
+    document root or on its `account`, `current_account`, `user` or `profile`
+    object; then the DOM fallback, which reads the profile popover while it is
+    open. `/api/organizations` is deliberately **not** used: it answers with the
+    organisations the session belongs to, and those can list other members.
   * Anything else - a changed shape, a 404, a roster with no current-user
     field - means `unknown account`, which means no capture.
 

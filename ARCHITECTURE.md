@@ -406,17 +406,22 @@ well under 1 second (import cost matters: lazy-import the mcp SDK and anything h
 * Options (chrome.storage.sync): `serverUrl` (default `http://127.0.0.1:47821`), `token`,
   `allowedAccounts` (list of emails), per-source enable toggles.
 * `serverUrl` must be `http://127.0.0.1` or `http://localhost` - the two hosts in
-  `host_permissions`, and the only ones `apc serve` binds without `--allow-remote`. The
-  service worker checks this before every `fetch` (not only in the options UI): a synced
-  or tampered setting must not be able to POST prompts, accounts or the token anywhere
-  else, and such a capture is refused rather than queued.
+  `host_permissions`. The listener is the looser end of the pair: without
+  `--allow-remote`, `apc serve` binds loopback addresses only, which is any
+  `127.x.y.z`, `::1` or `localhost`; the extension narrows that to exactly those two
+  names. The service worker checks this before every `fetch` (not only in the options
+  UI): a synced or tampered setting must not be able to POST prompts, accounts or the
+  token anywhere else, and such a capture is refused rather than queued.
 * Account detection (cached per tab for 10 minutes, refreshed on navigation; only
   successful detections are cached, and the cache lives in the content script's own
-  memory so one tab cannot read another tab's identity):
+  memory so one tab cannot read another tab's identity; a lookup that was still in
+  flight when the account was invalidated is discarded instead of cached, so a late
+  answer cannot stamp the next prompt with the previous identity):
   * claude.ai: `GET /api/auth/current_account`, then `GET /api/account`, with
     `credentials: "include"`, reading only a **current-user** field
-    (`email_address`/`email` on the payload root or its `account`/`current_account`/
-    `user`/`profile` object); fall back to reading the account menu in the DOM.
+    (`email_address`, `email`, `emailAddress` or `primary_email` on the payload root
+    or its `account`/`current_account`/`user`/`profile` object); fall back to reading
+    the account menu in the DOM.
     Roster endpoints such as `/api/organizations` must not be used: another member's
     address that happens to be allowlisted would file this user's prompts under it.
   * chatgpt.com: `GET /api/auth/session` with `credentials: "include"` -> `user.email`
@@ -441,8 +446,12 @@ well under 1 second (import cost matters: lazy-import the mcp SDK and anything h
   and 4 MiB of serialized JSON, oldest dropped first, quota errors handled) and retries
   with backoff. All queue read-modify-writes are serialized behind one lock. Queued items
   are re-validated against the current source/allowlist settings before a retry and
-  dropped if they no longer pass. Popup shows listener status and last-24h capture count;
-  only `202 {"stored": true}` counts towards it, while any 2xx dequeues the item.
+  dropped if they no longer pass. A delivery only counts as dequeued once the shorter
+  queue has actually been written: if storage refuses every attempt, the queue on disk
+  is left as it was and the flush reports nothing sent, rather than leaving delivered
+  items behind for the next tick to re-post. Popup shows listener status and last-24h
+  capture count; only `202 {"stored": true}` counts towards it, while any 2xx dequeues
+  the item.
 
 ## Quality bar
 

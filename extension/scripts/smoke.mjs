@@ -49,6 +49,11 @@ const SECRET_EMAIL = 'leaked.person@example.com';
 // Another member of the same organisation. It must never be mistaken for the
 // signed-in user: the allowlist contract says a wrong identity is worse than none.
 const DECOY_EMAIL = 'colleague@example.com';
+// The identity a *slow* account lookup answers with, after the page has already
+// navigated away from the document that asked for it.
+const STALE_EMAIL = 'previous.user@example.com';
+const RACE_BEFORE_ID = 'race-before-1111';
+const RACE_AFTER_ID = 'race-after-2222';
 const LINE_ONE = 'summarise the changelog';
 const LINE_TWO = `and cc ${SECRET_EMAIL}`;
 
@@ -119,6 +124,10 @@ async function loadPlaywright() {
 const received = { prompts: [], health: 0, config: 0, session: 0, currentAccount: 0, account: 0, unauthorised: 0 };
 // The fixture the catch-all serves; flipped when the claude phase starts.
 let currentFixture = FIXTURE_CHATGPT;
+// What GET /api/auth/session answers with, and how long it sits on the answer.
+// Phase 10 uses both to hold one lookup open across a navigation.
+let sessionEmail = ACCOUNT;
+let sessionDelayMs = 0;
 
 function cors(req, res) {
   res.setHeader('Access-Control-Allow-Origin', req.headers.origin || '*');
@@ -146,7 +155,13 @@ const server = http.createServer((req, res) => {
   // --- site stubs
   if (url.pathname === '/api/auth/session') {
     received.session += 1;
-    json(res, 200, { user: { id: 'user-1', email: ACCOUNT, name: 'Test User' }, expires: '2030-01-01T00:00:00Z' });
+    const body = { user: { id: 'user-1', email: sessionEmail, name: 'Test User' }, expires: '2030-01-01T00:00:00Z' };
+    if (sessionDelayMs > 0) {
+      const wait = sessionDelayMs;
+      setTimeout(() => json(res, 200, body), wait);
+      return;
+    }
+    json(res, 200, body);
     return;
   }
 
@@ -560,6 +575,53 @@ async function main() {
   );
   check('a rejected URL never reaches chrome.storage.sync', storedUrl === listenerUrl, JSON.stringify(storedUrl));
   check('options page accepts the loopback listener', /Saved/.test(await saveUrl(listenerUrl)), 'not saved');
+
+  // 10. an account lookup that is still in flight when the page navigates must
+  //     not repopulate the cache afterwards: the identity it describes belongs
+  //     to the document we just left, and the next prompt would be stamped with
+  //     it. The site answers slowly and with a *different* address, and the
+  //     navigation happens while that answer is still on the wire.
+  currentFixture = FIXTURE_CHATGPT;
+  sessionEmail = STALE_EMAIL;
+  sessionDelayMs = 3000;
+  const sessionsBefore = received.session;
+  const racePage = await context.newPage();
+  await racePage.goto(`https://chatgpt.com/c/${RACE_BEFORE_ID}`, { waitUntil: 'domcontentloaded' });
+  await racePage.waitForSelector('#prompt-textarea');
+  // The content script's warm-up lookup has reached the site and is now waiting
+  // on the slow answer: everything below happens inside that window.
+  const raceInFlight = await waitFor('the slow account lookup to start', async () => received.session > sessionsBefore, 10000, 100);
+  check('the account lookup is in flight', raceInFlight, `session hits: ${received.session}`);
+
+  // From here on the site is a different user: whatever the content script ends
+  // up reporting must be *this* identity, never the one still on the wire.
+  sessionEmail = ACCOUNT;
+  sessionDelayMs = 0;
+  // An SPA navigation plus a DOM mutation, which is what drives the content
+  // script's own navigation check (it is throttled, hence the second nudge).
+  await racePage.evaluate((id) => {
+    history.pushState({}, '', `/c/${id}`);
+    document.body.appendChild(document.createElement('div'));
+  }, RACE_AFTER_ID);
+  await racePage.waitForTimeout(800);
+  await racePage.evaluate(() => document.body.appendChild(document.createElement('div')));
+  // Let the slow answer land (and, with the bug, re-cache the old identity).
+  await racePage.waitForTimeout(3000);
+
+  const raceWhoami = await optionsPage.evaluate(async () => {
+    const tabs = await chrome.tabs.query({ url: 'https://chatgpt.com/c/race-after-*' });
+    if (!tabs.length) return { error: 'no race tab' };
+    try {
+      return await chrome.tabs.sendMessage(tabs[0].id, { type: 'whoami' });
+    } catch (err) {
+      return { error: String(err) };
+    }
+  });
+  check(
+    'a late account detection cannot outlive the navigation that cleared it',
+    raceWhoami && raceWhoami.account === ACCOUNT,
+    JSON.stringify(raceWhoami),
+  );
 }
 
 main()

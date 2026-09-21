@@ -323,6 +323,13 @@
     var lastTs = 0;
     var cachedComposer = null;
     var accountInFlight = null;
+    // Bumped by every invalidation (navigation, sign-out, bfcache restore, an
+    // explicit refresh). A detection that started under an older generation
+    // describes a document we have already left, so its answer is dropped
+    // instead of being cached: otherwise a result that lands just after
+    // forgetAccount() would repopulate the cache and stamp the next prompt with
+    // the previous identity.
+    var accountGeneration = 0;
 
     function isDuplicate(text) {
       return text === lastText && Date.now() - lastTs < DEDUP_WINDOW_MS;
@@ -334,6 +341,7 @@
     }
 
     function forgetAccount() {
+      accountGeneration += 1;
       accountInFlight = null;
       cacheClear(accountCacheKey);
     }
@@ -352,13 +360,16 @@
 
     function resolveAccount(forceRefresh) {
       if (forceRefresh) {
+        // A refresh invalidates the identity exactly like a navigation does.
+        accountGeneration += 1;
         accountInFlight = null;
         return cacheClear(accountCacheKey).then(function () {
           return resolveAccount(false);
         });
       }
       if (accountInFlight) return accountInFlight;
-      accountInFlight = cacheGet(accountCacheKey)
+      var generation = accountGeneration;
+      var pending = cacheGet(accountCacheKey)
         .then(function (cached) {
           if (typeof cached !== 'undefined') return cached;
           return Promise.resolve()
@@ -369,6 +380,10 @@
               return null;
             })
             .then(function (found) {
+              // The page navigated (or signed out) while this detection was in
+              // flight: the answer belongs to the document we just left, so it
+              // must neither be cached nor returned.
+              if (generation !== accountGeneration) return null;
               var email = normaliseEmail(found);
               return cacheSet(accountCacheKey, email).then(function () {
                 return email;
@@ -376,14 +391,16 @@
             });
         })
         .then(function (value) {
-          accountInFlight = null;
-          return value;
+          if (accountInFlight === pending) accountInFlight = null;
+          // Also covers a cache hit that was invalidated mid-read.
+          return generation === accountGeneration ? value : null;
         })
         .catch(function () {
-          accountInFlight = null;
+          if (accountInFlight === pending) accountInFlight = null;
           return null;
         });
-      return accountInFlight;
+      accountInFlight = pending;
+      return pending;
     }
 
     function currentComposer(eventTarget) {

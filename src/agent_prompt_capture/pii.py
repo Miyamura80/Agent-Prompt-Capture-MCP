@@ -81,9 +81,28 @@ def _credit_card_ok(text: str) -> bool:
     return luhn_ok(re.sub(r"[ -]", "", text))
 
 
+#: Registered IBAN length per country (ISO 13616). A country we do not know about
+#: falls back to the generic 15-34 range, so an unlisted country is never worse off.
+_IBAN_LENGTHS: dict[str, int] = {
+    entry[:2]: int(entry[2:])
+    for entry in (
+        "AD24 AE23 AL28 AT20 AZ28 BA20 BE16 BG22 BH22 BI27 BR29 BY28 "
+        "CH21 CR22 CY28 CZ24 DE22 DJ27 DK18 DO28 EE20 EG29 ES24 FI18 "
+        "FO18 FR27 GB22 GE22 GI23 GL18 GR27 GT28 HR21 HU28 IE22 IL23 "
+        "IQ23 IS26 IT27 JO30 KW30 KZ20 LB28 LC32 LI21 LT20 LU20 LV21 "
+        "LY25 MC27 MD24 ME22 MK19 MR27 MT31 MU30 NI28 NL18 NO15 PK24 "
+        "PL28 PS29 PT25 QA29 RO24 RS22 RU33 SA24 SC31 SD18 SE24 SI19 "
+        "SK24 SM27 ST25 SV28 TL23 TN24 TR26 UA29 VA22 VG24 XK20"
+    ).split()
+}
+
+
 def _iban_ok(text: str) -> bool:
     value = text.replace(" ", "").upper()
     if not 15 <= len(value) <= 34:
+        return False
+    expected = _IBAN_LENGTHS.get(value[:2])
+    if expected is not None and len(value) != expected:
         return False
     rearranged = value[4:] + value[:4]
     converted = "".join(str(int(c, 36)) if c.isalpha() else c for c in rearranged)
@@ -241,8 +260,10 @@ UUID_RE = re.compile(
 _UUID_EXEMPT: frozenset[str] = frozenset({"credit_card", "phone", "ssn", "iban"})
 
 #: An IBAN, written solid (``GB33BUKB20201555555555``) or in the printed form with
-#: grouping spaces (``GB33 BUKB 2020 1555 5555 55``). ``_iban_ok`` (mod-97) is what
-#: keeps the grouped alternative from swallowing ordinary uppercase prose.
+#: grouping spaces (``GB33 BUKB 2020 1555 5555 55``). The grouped alternative is greedy
+#: and will happily swallow a short uppercase word that follows the number, so the
+#: candidate it yields is validated (and, failing that, shortened group by group) by
+#: :func:`_iban_spans` rather than by a plain ``validator=`` on :func:`_add`.
 IBAN_RE = re.compile(
     r"\b[A-Z]{2}\d{2}"
     r"(?:[A-Z0-9]{11,30}|(?:[ ][A-Z0-9]{4})+(?:[ ][A-Z0-9]{1,4})?)"
@@ -347,6 +368,39 @@ def _add(
         if validator is not None and not validator(value):
             continue
         spans.append(_Span(start, end, category, value, priority, fixed))
+
+
+def _iban_spans(text: str) -> list[_Span]:
+    """IBAN candidates, shortened group by group until the mod-97 check passes.
+
+    ``(?:[ ][A-Z0-9]{4})+(?:[ ][A-Z0-9]{1,4})?`` is greedy, so a valid grouped IBAN
+    followed by a short uppercase word (``ES91 ... 1332 OPEN``, ``... POST``, ``... OK``)
+    matches as one oversized candidate. ``finditer`` only ever yields that maximal match,
+    so validating it and giving up would leave the account number in the clear. Instead
+    we drop trailing space-separated groups one at a time and keep the longest prefix
+    that is a well-formed IBAN. The solid form has no spaces and is tested exactly once.
+    """
+    spans: list[_Span] = []
+    priority = _priority("iban")
+    for match in IBAN_RE.finditer(text):
+        candidate = match.group(0)
+        while candidate:
+            if _iban_ok(candidate):
+                spans.append(
+                    _Span(
+                        match.start(),
+                        match.start() + len(candidate),
+                        "iban",
+                        candidate,
+                        priority,
+                    )
+                )
+                break
+            cut = candidate.rfind(" ")
+            if cut == -1:
+                break
+            candidate = candidate[:cut]
+    return spans
 
 
 def _home_spans(text: str) -> list[_Span]:
@@ -558,7 +612,7 @@ def scrub(
         _add(spans, text, pattern, "api_key", group=group)
     _add(spans, text, URL_CREDENTIALS_RE, "url_credentials")
     _add(spans, text, CREDIT_CARD_RE, "credit_card", validator=_credit_card_ok)
-    _add(spans, text, IBAN_RE, "iban", validator=_iban_ok)
+    spans.extend(_iban_spans(text))
     _add(spans, text, SSN_RE, "ssn")
     _add(spans, text, EMAIL_RE, "email")
     _add(spans, text, PHONE_RE, "phone", validator=_phone_ok)

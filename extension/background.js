@@ -249,32 +249,46 @@ async function readQueue() {
  * and treat a quota rejection as "drop the oldest half and try again" rather
  * than as a lost capture.
  *
- * @returns {Promise<{queue: object[], dropped: number}>} what is now stored
+ * When even an empty queue cannot be written the call reports `persisted:
+ * false` and hands back the queue that is *actually* stored (whatever was there
+ * before, untouched). It must never claim the queue is now empty: the caller
+ * would treat the items it meant to remove as removed while storage still holds
+ * them, and the next alarm would post them all over again.
+ *
+ * @returns {Promise<{queue: object[], dropped: number, persisted: boolean, error: string|null}>}
  */
-async function writeQueue(queue) {
+export async function writeQueue(queue) {
   const trimmed = trimQueueToBudget(queue, {
     maxItems: QUEUE_MAX_ITEMS,
     maxBytes: QUEUE_MAX_BYTES,
   });
   let candidate = trimmed.kept;
   let dropped = trimmed.dropped;
+  let lastErr = null;
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
       await chrome.storage.local.set({ [QUEUE_KEY]: candidate });
-      return { queue: candidate, dropped };
+      return { queue: candidate, dropped, persisted: true, error: null };
     } catch (err) {
       // QUOTA_BYTES / QUOTA_BYTES_PER_ITEM, or the profile's disk is full.
-      if (candidate.length === 0) {
-        await setLastError(`Could not persist the retry queue: ${describeError(err)}`);
-        return { queue: [], dropped };
-      }
+      lastErr = err;
+      if (candidate.length === 0) break;
       const half = Math.max(1, Math.floor(candidate.length / 2));
       dropped += half;
       candidate = candidate.slice(half); // the oldest go first
     }
   }
-  await setLastError('Could not persist the retry queue (storage quota exceeded)');
-  return { queue: [], dropped: dropped + candidate.length };
+  // Nothing was written, so nothing was dropped either: storage still holds the
+  // previous queue. Report that queue, not an imaginary empty one.
+  const error = lastErr ? describeError(lastErr) : 'storage quota exceeded';
+  await setLastError(`Could not persist the retry queue: ${error}`);
+  let stored = [];
+  try {
+    stored = await readQueue();
+  } catch {
+    stored = [];
+  }
+  return { queue: stored, dropped: 0, persisted: false, error };
 }
 
 export function backoffMs(attempts) {
@@ -282,15 +296,18 @@ export function backoffMs(attempts) {
   return minutes * 60 * 1000;
 }
 
+/**
+ * Queue a payload the POST could not deliver. The caller owns `apc_last_error`:
+ * it already has a transport error to report, and a drop warning raised here
+ * would only be overwritten by it (the user would never learn that older
+ * captures were thrown away), so the facts are returned instead of stored.
+ */
 async function enqueue(payload) {
   const result = await withQueueLock(async () => {
     const queue = await readQueue();
     queue.push({ payload, attempts: 1, nextAt: Date.now() + backoffMs(1) });
     return writeQueue(queue);
   });
-  if (result.dropped > 0) {
-    await setLastError(`Retry queue full: dropped ${result.dropped} older capture(s)`);
-  }
   await ensureRetryAlarm();
   return result;
 }
@@ -312,7 +329,7 @@ function queueItemProblem(payload, options) {
   return null;
 }
 
-async function flushQueue() {
+export async function flushQueue() {
   return withQueueLock(async () => {
     let queue = await readQueue();
     if (queue.length === 0) return { sent: 0, stored: 0, dropped: 0, remaining: 0 };
@@ -360,12 +377,29 @@ async function flushQueue() {
     }
 
     const written = await writeQueue(keep);
+    if (!written.persisted) {
+      // The replacement queue never reached storage, so the queue on disk is
+      // still the one we started from - delivered items included. Counting them
+      // as sent (and as captures) here is what made the next alarm re-post
+      // prompts the listener already had, so count nothing and say why.
+      await setLastError(
+        `Could not persist the retry queue: ${written.error}; ${sent} delivered item(s) stay queued`,
+      );
+      return {
+        sent: 0,
+        stored: 0,
+        dropped: 0,
+        remaining: written.queue.length,
+        persisted: false,
+        error: written.error,
+      };
+    }
     queue = written.queue;
     dropped += written.dropped;
     if (stored > 0) await recordCaptures(stored);
     if (lastError) await setLastError(`Retry failed: ${lastError}`);
     else if (sent > 0) await setLastError(null);
-    return { sent, stored, dropped, remaining: queue.length };
+    return { sent, stored, dropped, remaining: queue.length, persisted: true };
   });
 }
 
@@ -434,9 +468,16 @@ export async function handleCapture(rawPayload) {
     };
   } catch (err) {
     const message = describeError(err);
-    await enqueue(payload);
-    await setLastError(message);
-    return { ok: false, queued: true, error: message };
+    const queued = await enqueue(payload);
+    // Both facts belong in the one slot the popup reads: the POST failed, AND
+    // the queue may have dropped older captures (or refused the new one). The
+    // transport error used to overwrite the drop warning, so a capture that was
+    // gone for good was reported as a retry that had not happened yet.
+    const notes = [];
+    if (queued.dropped > 0) notes.push(`retry queue full: dropped ${queued.dropped} older capture(s)`);
+    if (!queued.persisted) notes.push(`this capture could not be queued: ${queued.error}`);
+    await setLastError(notes.length ? `${message} (${notes.join('; ')})` : message);
+    return { ok: false, queued: !!queued.persisted, dropped: queued.dropped, error: message };
   }
 }
 

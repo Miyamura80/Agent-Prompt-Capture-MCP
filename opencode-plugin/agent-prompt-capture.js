@@ -36,10 +36,13 @@ function spawnDetached(json) {
       resolve();
     }
 
-    // The timer and the child stay referenced on purpose: a caller that awaits this
-    // promise (the per-session chain, or a short-lived host such as the e2e driver)
-    // must not have its event loop drain before the child exits. done() clears the
-    // timer, so a healthy child never holds the host open past its own runtime.
+    // The child is unref'd below (a hung `apc capture` must never keep OpenCode
+    // alive), so this timer is what holds the event loop open instead: a caller that
+    // awaits this promise (the per-session chain, or a short-lived host such as the
+    // e2e driver) must not drain before the child exits. Events on an unref'd child
+    // still fire while the timer runs, and done() clears the timer, so a healthy
+    // child releases the host as soon as it exits and a hung one after
+    // SPAWN_TIMEOUT_MS. The timer itself is deliberately NOT unref'd.
     timer = setTimeout(done, SPAWN_TIMEOUT_MS);
 
     // Bun first (OpenCode's server runs on Bun), node:child_process otherwise.
@@ -60,6 +63,12 @@ function spawnDetached(json) {
     }
 
     if (spawned) {
+      try {
+        // Detach from the host's event loop: a hung child must not keep it alive.
+        if (typeof spawned.unref === "function") spawned.unref();
+      } catch (_) {
+        // older Bun without unref(); the 10 s timer is still the backstop
+      }
       try {
         spawned.stdin.write(json);
         spawned.stdin.end();
@@ -82,6 +91,10 @@ function spawnDetached(json) {
           stdio: ["pipe", "ignore", "ignore"],
           detached: true,
         });
+        // Detach from the host's event loop: a hung child must not keep it alive.
+        // The SPAWN_TIMEOUT_MS timer above, not the child, is what keeps a
+        // short-lived host running long enough to see "close".
+        child.unref();
         // A missing `apc` surfaces as an async "error" event, never a throw.
         child.on("error", () => done());
         child.on("close", () => done());
