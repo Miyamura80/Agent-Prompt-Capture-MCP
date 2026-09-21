@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Agent Prompt Capture</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="popup">
+      <h1>Agent Prompt Capture</h1>
+      <dl class="kv">
+        <dt>Listener</dt>
+        <dd id="listener">checking...</dd>
+        <dt>Account</dt>
+        <dd id="account">-</dd>
+        <dt>Allowlisted</dt>
+        <dd id="allowlisted">-</dd>
+        <dt>Source</dt>
+        <dd id="source">-</dd>
+        <dt>Last 24h</dt>
+        <dd id="last24h">-</dd>
+        <dt>Queued</dt>
+        <dd id="queued">-</dd>
+        <dt>Last error</dt>
+        <dd id="lastError">none</dd>
+      </dl>
+      <div class="footer">
+        <a id="openOptions" href="#">Options</a>
+        <span id="version" class="hint"></span>
+      </div>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

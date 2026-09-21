@@ -1,0 +1,14 @@
+{
+  "name": "agent-prompt-capture-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome MV3 extension for Agent Prompt Capture. No build step; package.json exists only so node tooling treats the .js files as ES modules and so the tests can resolve playwright.",
+  "scripts": {
+    "test": "node scripts/test-prescrub.js && node scripts/test-limits.js",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.56.1"
+  }
+}

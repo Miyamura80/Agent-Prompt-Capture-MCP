@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Fake chat | ChatGPT</title>
+    <style>
+      body { font: 15px system-ui, sans-serif; margin: 0; padding: 24px; background: #fff; color: #111; }
+      #transcript { min-height: 120px; margin-bottom: 16px; }
+      .msg { white-space: pre-wrap; border: 1px solid #ddd; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
+      form { display: flex; gap: 8px; align-items: flex-end; }
+      #prompt-textarea {
+        flex: 1; min-height: 44px; padding: 10px 12px; border: 1px solid #bbb;
+        border-radius: 10px; outline: none; white-space: pre-wrap;
+      }
+      #prompt-textarea p { margin: 0; }
+      button { padding: 10px 16px; border-radius: 10px; border: 1px solid #bbb; background: #f3f3f3; cursor: pointer; }
+    </style>
+  </head>
+  <body>
+    <!--
+      Offline stand-in for the chatgpt.com composer used by extension/scripts/smoke.mjs.
+      It mimics the two things the content script depends on:
+        1. a contenteditable #prompt-textarea (ProseMirror-ish)
+        2. an app keydown handler that CLEARS the composer on Enter,
+           which is what makes "read the text before the app clears it" testable.
+    -->
+    <div id="transcript"></div>
+    <form id="composer-form" autocomplete="off">
+      <div
+        id="prompt-textarea"
+        class="ProseMirror"
+        contenteditable="true"
+        data-placeholder="Ask anything"
+        role="textbox"
+      ><p><br /></p></div>
+      <button type="submit" data-testid="send-button" aria-label="Send prompt">Send</button>
+    </form>
+
+    <script>
+      (function () {
+        var editor = document.getElementById('prompt-textarea');
+        var form = document.getElementById('composer-form');
+        var transcript = document.getElementById('transcript');
+
+        function submitPrompt() {
+          var text = editor.innerText.replace(/ /g, ' ').trim();
+          if (!text) return;
+          var div = document.createElement('div');
+          div.className = 'msg';
+          div.textContent = text;
+          transcript.appendChild(div);
+          // The real app wipes the composer immediately.
+          editor.innerHTML = '<p><br></p>';
+          window.__lastSubmitted = text;
+        }
+
+        editor.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && !e.isComposing) {
+            e.preventDefault();
+            submitPrompt();
+          }
+        });
+
+        form.addEventListener('submit', function (e) {
+          e.preventDefault();
+          submitPrompt();
+        });
+      })();
+    </script>
+  </body>
+</html>

@@ -246,7 +246,7 @@ Rules:
   (`scheme://user:pass@host` -> `scheme://[URL_CREDENTIALS_1]@host`), `credit_card` (13-19 digits
   with optional separators, Luhn-valid), `iban`, `ssn` (US), `email`, `phone` (E.164 and common
   US/UK/EU formats, min 7 digits, must not be inside a longer digit run), `ipv6`, `ipv4`
-  (skip 127.0.0.1, 0.0.0.0, and RFC1918? NO: redact private IPs too, they identify a network),
+  (loopback 127.0.0.0/8 and 0.0.0.0 are left alone; RFC1918 private ranges ARE redacted, they identify a network),
   `mac_address`, `home_path` (via scrub_path rules), `user_term` (extra_terms, word-bounded,
   case-insensitive), `custom` (extra_patterns), `person` / `location` (only when enable_ner).
 * Must not mangle code: do not treat `foo@bar` without a TLD as an email; do not treat
@@ -381,7 +381,7 @@ Install snippet for Claude Code: `claude mcp add agent-prompt-capture -- apc mcp
 ## CLI (`cli.py`)
 
 ```
-apc capture <claude-code|codex|opencode>   read hook JSON on stdin, ingest, exit 0 always
+apc capture <claude-code|codex|opencode> [PAYLOAD]   read hook JSON on stdin (or the trailing argv arg, Codex legacy notify), ingest, exit 0 always
 apc serve [--host H] [--port P] [--allow-remote]
 apc mcp
 apc install <claude-code|codex|opencode> [--dry-run]     writes/merges hook config idempotently
@@ -405,10 +405,28 @@ well under 1 second (import cost matters: lazy-import the mcp SDK and anything h
   `http://localhost/*`.
 * Options (chrome.storage.sync): `serverUrl` (default `http://127.0.0.1:47821`), `token`,
   `allowedAccounts` (list of emails), per-source enable toggles.
-* Account detection (cached per tab for 10 minutes, refreshed on navigation):
-  * claude.ai: try the account/organization API endpoints the app itself calls with
-    `credentials: "include"`; fall back to reading the account menu in the DOM. See research doc.
-  * chatgpt.com: `GET /api/auth/session` with `credentials: "include"` -> `user.email`.
+* `serverUrl` must be `http://127.0.0.1` or `http://localhost` - the two hosts in
+  `host_permissions`. The listener is the looser end of the pair: without
+  `--allow-remote`, `apc serve` binds loopback addresses only, which is any
+  `127.x.y.z`, `::1` or `localhost`; the extension narrows that to exactly those two
+  names. The service worker checks this before every `fetch` (not only in the options
+  UI): a synced or tampered setting must not be able to POST prompts, accounts or the
+  token anywhere else, and such a capture is refused rather than queued.
+* Account detection (cached per tab for 10 minutes, refreshed on navigation; only
+  successful detections are cached, and the cache lives in the content script's own
+  memory so one tab cannot read another tab's identity; a lookup that was still in
+  flight when the account was invalidated is discarded instead of cached, so a late
+  answer cannot stamp the next prompt with the previous identity):
+  * claude.ai: `GET /api/auth/current_account`, then `GET /api/account`, with
+    `credentials: "include"`, reading only a **current-user** field
+    (`email_address`, `email`, `emailAddress` or `primary_email` on the payload root
+    or its `account`/`current_account`/`user`/`profile` object); fall back to reading
+    the account menu in the DOM.
+    Roster endpoints such as `/api/organizations` must not be used: another member's
+    address that happens to be allowlisted would file this user's prompts under it.
+  * chatgpt.com: `GET /api/auth/session` with `credentials: "include"` -> `user.email`
+    and nothing else.
+  * Any other shape means "unknown account", which means no capture.
 * Capture trigger: intercept the composer submit (Enter without Shift, or click on the send
   button) and read the composer text **before** the app clears it. Never modify the page's
   behaviour. Never capture if account is unknown or not allowlisted (the server enforces
@@ -417,8 +435,23 @@ well under 1 second (import cost matters: lazy-import the mcp SDK and anything h
   `chatgpt.com/codex*` -> `codex_cloud`; other `chatgpt.com` -> `chatgpt_web`.
 * Extension applies a light pre-scrub (emails, obvious API keys) before sending, as defence
   in depth; the server does the full scrub.
-* Background service worker queues failed POSTs in `chrome.storage.local` (max 500) and
-  retries with backoff; popup shows listener status and last-24h capture count.
+* The pre-scrub's markers are flat (`[EMAIL]`, `[API_KEY]`) and deliberately not in the
+  server's numbered `[CATEGORY_N]` form: the server cannot renumber or count a value the
+  browser already replaced, so client-scrubbed categories never appear in `pii_findings`,
+  and a numbered client marker could collide with a server placeholder for a different
+  value in the same record.
+* The worker caps the prompt so the *serialized* body stays under the listener's 1 MiB
+  limit (UTF-8 bytes, not characters), and sets `truncated: true` when it cuts.
+* Background service worker queues failed POSTs in `chrome.storage.local` (max 500 items
+  and 4 MiB of serialized JSON, oldest dropped first, quota errors handled) and retries
+  with backoff. All queue read-modify-writes are serialized behind one lock. Queued items
+  are re-validated against the current source/allowlist settings before a retry and
+  dropped if they no longer pass. A delivery only counts as dequeued once the shorter
+  queue has actually been written: if storage refuses every attempt, the queue on disk
+  is left as it was and the flush reports nothing sent, rather than leaving delivered
+  items behind for the next tick to re-post. Popup shows listener status and last-24h
+  capture count; only `202 {"stored": true}` counts towards it, while any 2xx dequeues
+  the item.
 
 ## Quality bar
 
@@ -427,3 +460,74 @@ well under 1 second (import cost matters: lazy-import the mcp SDK and anything h
   disabled sources), adapters (each payload shape), http listener (auth, CORS, payload),
   mcp server (tool listing + one call per tool via in-memory client), installer (idempotent merge).
 * No network access at test time. No writes outside a tmp `APC_HOME` in tests.
+
+## Time tracking layer (primary use case)
+
+The purpose of the data is to let an agent answer **"what has this person been spending
+their time on, and how could they use it better"**. Prompt text alone is not enough; we
+also need *when* work happened, *how long* the agent worked per prompt, and *how the user's
+attention moved between projects*.
+
+### Extra captured signal: turn-end events
+
+| source        | event                              | how                                         |
+|---------------|------------------------------------|---------------------------------------------|
+| `claude_code` | `Stop` hook (agent finished turn)  | `apc capture claude-code` (same command; adapter branches on `hook_event_name`) |
+| `codex_cli`   | `Stop` hook (native hooks.json)    | `apc capture codex`; the legacy `notify` `agent-turn-complete` payload (`--legacy`) is also a turn end and carries the prompt text |
+| `opencode`    | `event` hook `session.idle`        | plugin pipes `{"event":"turn_end","session_id":...,"ts":...}` to `apc capture opencode` |
+| browser       | none for now                       | (DOM heuristics too fragile; future work)   |
+
+Adapters therefore return either a `RawPrompt` or a `RawTurnEnd(session_id, ts, metadata)`.
+`ingest()` handles `RawTurnEnd` by calling `store.mark_turn_end(source, session_id, ts)`,
+which sets `turn_end_ts` on the most recent prompt in that session whose `turn_end_ts` is
+NULL (no-op if none). For `codex_cli` `agent-turn-complete`, ingest first inserts the prompt
+(with `ts` = now minus nothing better; keep `metadata.turn_complete_ts`) and then marks it
+ended in the same call.
+
+### Schema additions
+
+```sql
+ALTER TABLE prompts ADD COLUMN turn_end_ts TEXT;        -- ISO UTC, NULL until the agent finishes
+CREATE INDEX IF NOT EXISTS idx_prompts_session_ts ON prompts(session_id, ts);
+```
+
+`PromptRecord` gains `turn_end_ts: str | None`. Derived (not stored) fields exposed by the
+store/MCP: `agent_seconds = turn_end_ts - ts`, `think_seconds = next prompt ts in same
+session - turn_end_ts` (NULL when unknown).
+
+### config.toml additions
+
+```toml
+[time]
+idle_gap_minutes = 30   # a gap longer than this splits an activity session
+tail_minutes = 5        # credited after the last prompt / turn end of an activity session
+```
+
+### Derived activity sessions (heuristic, computed on read in `timeline.py`)
+
+1. Take all prompts (and their `turn_end_ts`) in range, ordered by `ts`, grouped by
+   `(source, project)` when `group_by` needs it, else globally.
+2. Walk in time order. Start a new activity session when the gap between the previous
+   event's end (`turn_end_ts` if set else `ts`) and the next `ts` exceeds `idle_gap_minutes`.
+3. `active_minutes` of a session = `(last_end - first_ts) + tail_minutes`.
+4. A **context switch** is a consecutive pair of prompts (within one activity session, any
+   grouping) whose `project` differs.
+
+### MCP tools added
+
+| tool                | args                                                                 | returns |
+|---------------------|----------------------------------------------------------------------|---------|
+| `time_summary`      | `since="7d"`, `until?`, `group_by` in `project\|source\|day\|hour_of_day\|weekday\|session` | `{groups:[{key, active_minutes, prompt_count, agent_minutes, avg_think_seconds}], total_active_minutes, context_switches}` |
+| `activity_timeline` | `since="24h"`, `until?`, `bucket` in `hour\|day`                     | `{buckets:[{start, prompt_count, active_minutes, projects:[...], sources:[...]}]}` |
+| `daily_digest`      | `date` (YYYY-MM-DD, default today, local time)                      | `{date, first_activity, last_activity, active_minutes, sessions:[{project, source, start, end, prompt_count, sample_prompts:[3 shortest]}], context_switches, top_terms:[...]}` |
+
+`top_terms` = top 15 lower-cased tokens of length >= 4 after removing a small stopword list
+and any placeholder tokens like `[EMAIL_1]`. Hour-of-day and weekday grouping and `daily_digest`
+use the local timezone of the machine running the MCP server.
+
+Resource added: `apc://digest/today`.
+
+CLI added: `apc time [--since 7d] [--group-by project]` and `apc digest [DATE]`.
+
+The `prompt_stats` tool stays as the cheap count-only query; `time_summary` is the one an
+agent should reach for when asked about time use.

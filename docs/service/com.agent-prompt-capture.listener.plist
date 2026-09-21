@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- macOS launchd user agent for the Agent Prompt Capture HTTP listener.
+     Install:
+       cp docs/service/com.agent-prompt-capture.listener.plist ~/Library/LaunchAgents/
+       launchctl load -w ~/Library/LaunchAgents/com.agent-prompt-capture.listener.plist
+     Replace /usr/local/bin/apc with the output of `which apc`, or use
+     `uvx --from /path/to/Agent-Prompt-Capture-MCP apc serve`.
+     See the "Browser capture" section of README.md for the rest of the setup
+     (`apc token`, the extension Options, and the two allowlists). -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent-prompt-capture.listener</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/apc</string>
+    <string>serve</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/apc-listener.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/apc-listener.err.log</string>
+</dict>
+</plist>

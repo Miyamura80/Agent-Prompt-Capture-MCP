@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node / extension tooling
+node_modules/
+extension/scripts/.tmp/
+
+# Runtime data (never commit captured prompts)
+.apc-home/
+*.db
+*.db-wal
+*.db-shm
+apc.log*
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

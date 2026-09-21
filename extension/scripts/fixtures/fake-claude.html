@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Refactor the parser - Claude</title>
+    <style>
+      body { font: 15px system-ui, sans-serif; margin: 0; padding: 24px; }
+      #transcript { min-height: 100px; }
+      .msg { white-space: pre-wrap; border: 1px solid #ddd; border-radius: 8px; padding: 8px 10px; margin-bottom: 8px; }
+      fieldset { border: 1px solid #bbb; border-radius: 12px; padding: 8px; }
+      .ProseMirror { min-height: 44px; outline: none; white-space: pre-wrap; }
+      .ProseMirror p { margin: 0; }
+      [hidden] { display: none !important; }
+      #user-menu { border: 1px solid #ccc; border-radius: 8px; padding: 8px; margin-bottom: 12px; }
+    </style>
+  </head>
+  <body>
+    <!--
+      Offline stand-in for the claude.ai composer used by extension/scripts/smoke.mjs.
+      Both account API endpoints 404 in the smoke server, so this exercises the
+      DOM fallback: the email only becomes readable once the profile popover is
+      actually open.
+    -->
+    <div id="user-menu" data-testid="user-menu-popover" hidden>Signed in as me@work.com</div>
+    <div id="transcript"></div>
+    <fieldset>
+      <div class="ProseMirror" contenteditable="true" data-placeholder="How can I help you today?" role="textbox"><p><br /></p></div>
+    </fieldset>
+    <button aria-label="Send Message" type="button">Send</button>
+
+    <script>
+      (function () {
+        var editor = document.querySelector('.ProseMirror');
+        var transcript = document.getElementById('transcript');
+
+        function submitPrompt() {
+          var text = editor.innerText.replace(/ /g, ' ').trim();
+          if (!text) return;
+          var div = document.createElement('div');
+          div.className = 'msg';
+          div.textContent = text;
+          transcript.appendChild(div);
+          editor.innerHTML = '<p><br></p>';
+          window.__lastSubmitted = text;
+        }
+
+        editor.addEventListener('keydown', function (e) {
+          if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey && !e.isComposing) {
+            e.preventDefault();
+            submitPrompt();
+          }
+        });
+        document.querySelector('button[aria-label="Send Message"]').addEventListener('click', submitPrompt);
+
+        window.__openUserMenu = function () {
+          document.getElementById('user-menu').hidden = false;
+        };
+      })();
+    </script>
+  </body>
+</html>
