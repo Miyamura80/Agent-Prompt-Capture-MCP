@@ -294,4 +294,5 @@ def test_file_selection(path: str, dockerfile: bool, actions: bool) -> None:
 def test_flow_line_anchor_runs_are_linear() -> None:
     start = time.monotonic()
     c.check_actions_file("ci.yaml", ["key: " + "&" * 5000 + "x"])
+    c.check_actions_file("ci.yaml", ["key: " + "!<a> " * 1000 + "x"])
     assert time.monotonic() - start < 1
